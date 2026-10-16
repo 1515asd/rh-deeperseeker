@@ -1,45 +1,45 @@
 {% extends "base.html" %}
-{% block title %}Dashboard - DeeperSeeker{% endblock %}
+{% block title %}仪表盘 - DeeperSeeker{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
+<h1>仪表盘</h1>
 
 <section>
-    <h2>Add Auth Token</h2>
+    <h2>添加认证令牌</h2>
     <div class="steps">
-        <p><strong>Steps:</strong></p>
+        <p><strong>步骤：</strong></p>
         <ol>
-            <li>Open <strong>incognito/private</strong> window</li>
-            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
-            <li>Open DevTools (F12) → Console → paste:</li>
+            <li>打开浏览器<strong>无痕/隐私窗口</strong></li>
+            <li>访问 <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> 并登录</li>
+            <li>打开开发者工具（F12）→ 控制台（Console）→ 粘贴：</li>
         </ol>
         <code>JSON.parse(localStorage.getItem("userToken")).value</code>
         <ol start="4">
-            <li>Copy the token and paste below</li>
-            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
-            <li><strong>Close the incognito window</strong> to preserve the login</li>
+            <li>复制令牌并粘贴到下方</li>
+            <li><strong>去掉两侧的引号</strong>——只粘贴令牌字符串本身</li>
+            <li><strong>关闭无痕窗口</strong>（保留浏览器里的登录状态）</li>
         </ol>
     </div>
     <div class="warning">
-        If you logout from DeepSeek in browser, this token stops working.
+        注意：如果你在浏览器里退出 DeepSeek 登录，此令牌会随之失效。
     </div>
     <form method="post" action="/tokens/add">
-        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
-        <button type="submit">Add Token</button>
+        <input type="text" name="alias" placeholder="别名（可选，例如：主号、小号1）" style="width:220px">
+        <input type="text" name="auth_token" placeholder="在此粘贴令牌（不要带引号）" style="width:400px">
+        <button type="submit">添加令牌</button>
     </form>
 </section>
 
 <section>
-    <h2>Tokens ({{ tokens|length }})</h2>
+    <h2>令牌池（{{ tokens|length }}）</h2>
     {% if tokens %}
     <table>
         <thead>
             <tr>
                 <th>ID</th>
-                <th>Alias</th>
-                <th>Token</th>
-                <th>Status</th>
-                <th>Actions</th>
+                <th>别名</th>
+                <th>令牌</th>
+                <th>状态</th>
+                <th>操作</th>
             </tr>
         </thead>
         <tbody>
@@ -50,13 +50,13 @@
                 <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                 <td>
                     <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
-                        {{ tok['status'] }}
+                        {{ {'ACTIVE':'正常','RATE_LIMITED':'限速冷却'}.get(tok['status'], tok['status']) }}
                     </span>
                 </td>
                 <td>
                     <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
-                          onsubmit="return confirm('Delete?')">
-                        <button type="submit" class="btn-sm btn-danger">Delete</button>
+                          onsubmit="return confirm('确定删除吗？')">
+                        <button type="submit" class="btn-sm btn-danger">删除</button>
                     </form>
                 </td>
             </tr>
@@ -64,14 +64,14 @@
         </tbody>
     </table>
     {% else %}
-    <p>No tokens yet.</p>
+    <p>暂无令牌，请在上方添加。</p>
     {% endif %}
 </section>
 
 <section>
-    <h2>API</h2>
-    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
-    <p>Anthropic: <code>http://localhost:4000</code></p>
-    <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
+    <h2>接口信息</h2>
+    <p>OpenAI 兼容：<code>http://147.124.213.50:19538/v1</code></p>
+    <p>Anthropic 兼容：<code>http://147.124.213.50:19538</code></p>
+    <p>模型：<code>v4.1flash</code>（DeepSeek 默认模型）</p>
 </section>
 {% endblock %}
