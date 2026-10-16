@@ -873,6 +873,15 @@ async def handle_chat(
                 if fid not in ref_set:
                     await _db(record_file, fid, token_id)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
+        if tools and not is_first:
+            # 工具指令漂移修复：会话复用模式下，工具说明只在会话首条消息注入，
+            # 长对话中遵从率衰减。续接消息时重注入一行精简格式提醒。
+            prompt += (
+                "\n\n[格式提醒] 若需要调用工具，输出且仅输出一个 "
+                '<tool_call>{"name": "工具名", "arguments": {...}}</tool_call> 块'
+                "（arguments 为合法 JSON 对象）；若无需调用工具，直接回答正文，"
+                "不要输出该标签。"
+            )
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
@@ -2043,4 +2052,4 @@ async def health(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "4000")))
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "4000")))

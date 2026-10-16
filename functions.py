@@ -1393,6 +1393,11 @@ class _SseStreamFinished(Exception):
     pass
 
 
+class _SseStreamInterrupted(Exception):
+    """上游流在收到 FINISHED 之前异常结束（断流/断连/上游提前关闭）。"""
+
+
+
 def _redact_sse_line(line: str) -> str:
     if len(line) > 500:
         return line[:500] + "..."
@@ -1468,7 +1473,7 @@ def _raise_sse_error_event(data, recent_lines):
     raise UpstreamError(502, content)
 
 
-async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
+async def _send_message_once(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
     if parent_message_id == 0:
@@ -1490,6 +1495,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
     think_open = False
     got_output = False
+    finished = False
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers, json=json_data,
@@ -1602,6 +1608,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                     async for out in _consume_sse_line(decoded_line):
                         yield out
                 except _SseStreamFinished:
+                    finished = True
                     return
 
         if line_buf.strip():
@@ -1611,12 +1618,44 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                     async for out in _consume_sse_line(decoded_line):
                         yield out
                 except _SseStreamFinished:
+                    finished = True
                     return
 
         if think_open:
             yield "\n</think>\n\n"
         if not got_output:
             _raise_empty_sse_response(recent_lines, parsed_events)
+        if not finished:
+            logger.warning("[auto-continue] 上游流未收到 FINISHED 即结束（疑似中断）")
+            raise _SseStreamInterrupted()
+
+
+async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None, max_continue=2):
+    """带自动续写的对外入口。
+
+    上游流在 FINISHED 之前异常中断（断流/断连/上游提前关闭）时，自动以
+    『继续』在同会话内续写——parent 按 next_parent 语义（+2）链式前进，
+    续写内容无缝拼进同一个客户端流。最多自动续写 max_continue 次。
+    """
+    parent = parent_message_id
+    msg = message
+    files = file_ids_
+    for attempt in range(max_continue + 1):
+        try:
+            async for chunk in _send_message_once(chat_id, auth_token, msg, parent, thinking, search, files):
+                yield chunk
+            return  # 正常完成（上游发出 FINISHED）
+        except _SseStreamFinished:
+            return
+        except _SseStreamInterrupted:
+            pass
+        if attempt >= max_continue:
+            logger.warning("[auto-continue] 自动续写已达上限(%d)，按现状收尾", max_continue)
+            return
+        logger.warning("[auto-continue] 上游流未正常结束，自动续写第 %d/%d 次", attempt + 1, max_continue)
+        parent = parent + 2  # next_parent 语义：本次 exchange 上游产生 user+assistant 两条消息
+        msg = "继续"
+        files = []
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
