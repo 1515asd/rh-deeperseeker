@@ -246,7 +246,20 @@ async def _db(fn, *args, **kwargs):
 async def lifespan(app: FastAPI):
     await _db(init_db)
     _install_key_access_formatter()
+    # ds_backup: token-pool disaster recovery — auto-restore missing tokens at
+    # startup, periodic encrypted off-site backup while running. Silently
+    # no-ops unless DEEPSEEKER_BACKUP_SECRET is configured.
+    backup_task = None
+    try:
+        import ds_backup
+        restored = await asyncio.to_thread(ds_backup.restore_if_needed)
+        print(f"[ds_backup] {restored}", flush=True)
+        backup_task = asyncio.create_task(ds_backup.background_loop())
+    except Exception as exc:
+        print(f"[ds_backup] disabled: {exc}", flush=True)
     yield
+    if backup_task is not None:
+        backup_task.cancel()
     # Stage 1 minor list: release the shared aiohttp ClientSession so shutdown
     # does not leak its connector sockets.
     await close_session()
