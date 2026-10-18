@@ -106,9 +106,29 @@ cp .env.example .env
 
 ## Auth Token Setup
 
-1. Open incognito window -> `chat.deepseek.com` -> Login
-2. Console (F12): `JSON.parse(localStorage.getItem("userToken")).value`
-3. Paste raw token string into Dashboard (`/dashboard`). Close incognito window.
+1. Open a private/incognito window -> `chat.deepseek.com` -> Login
+2. Extract the token — **pick the method matching your device** (both are kept, either works):
+
+   **A. Desktop / Android (has devtools)**: Console (F12) ->
+   `JSON.parse(localStorage.getItem("userToken")).value`
+
+   **B. iPhone / iPad (Safari bookmarklet)**: iOS has no F12 console, and Safari refuses
+   to run `javascript:` typed into the address bar — so use a saved bookmark:
+
+   1. Safari: open any page -> Share -> **Add Bookmark** -> Save
+   2. Open the bookmarks list -> **Edit** that entry -> replace its address with the code
+      below (name it something recognisable, e.g. `DS token`) -> Save
+   3. On `chat.deepseek.com` (logged in, page fully loaded) -> tap the bookmarks icon ->
+      tap `DS token`. The token is copied to your clipboard and shown in an alert.
+
+   ```javascript
+   javascript:(function(){var t='';try{var r=localStorage.getItem('userToken');if(r){try{t=JSON.parse(r).value||r;}catch(e){t=r;}}}catch(e){alert('Read failed: '+e.message);return;}if(!t||t.length<20){alert('No userToken found. Make sure you are logged in to chat.deepseek.com and the page finished loading.');return;}var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();a.setSelectionRange(0,999999);var ok=document.execCommand('copy');a.remove();alert((ok?'Copied to clipboard\n\n':'Copy failed — long-press to copy manually\n\n')+'length '+t.length+'\n'+t.substring(0,12)+'...');})();
+   ```
+
+   > Android users can also use this bookmarklet (recent Chrome versions block pasting
+   > `javascript:` into the address bar), or keep using the F12 console above.
+
+3. Paste the raw token string into the Dashboard (`/dashboard`). Close the private window.
 
 ## API Endpoints & Usage
 
