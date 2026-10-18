@@ -163,3 +163,17 @@ Educational purpose only. This project is not affiliated with, endorsed by, or s
 ## Contributors
 
 [![Contributors](https://contrib.rocks/image?repo=amancode22/deeperseeker)](https://github.com/amancode22/deeperseeker/graphs/contributors)
+
+## Additional Terms
+
+(These terms were part of the upstream LICENSE file and are reproduced here in
+full — nothing has been removed.)
+
+This software is not affiliated with, endorsed by, or sponsored by DeepSeek.
+Users must not use this software to violate any platform's terms of service, to
+resell or share access, or on accounts they do not own.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 AmanCode22 (upstream author).
+This fork's improvements are released under the same MIT license.
