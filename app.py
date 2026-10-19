@@ -931,13 +931,11 @@ async def handle_chat(
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
-        if stream and tools and not is_anthropic:
-            # 工具轮走可靠的非流式管线，结果伪流式吐出。
-            # 背景：流式透传路径的 think/DSML 标记解析在真实负载上会产生
-            # 内容损坏（思考泄漏进正文、DSML 工具标记碎裂直达客户端、
-            # 工具循环卡死，2026-10-20 截图实锤）；非流式管线（全文聚齐
-            # 后 parse_tools + 剥离）实测 100% 可靠。代价：首字节要等
-            # 官网生成完毕（与客户端感知的"输出完"一致）。
+        if stream and tools and not is_anthropic and os.getenv("DEEPSEEKER_STREAM_SPLITTER", "1") != "1":
+            # 降级路径（开关关闭时）：工具轮走可靠的非流式管线 + 伪流式输出。
+            # 默认关闭——v14 的 _StreamTagSplitter 已把流式标记解析改为
+            # 跨 chunk 安全（穷举切分一致性测试通过），无需牺牲首字节。
+            # 真出问题随时 DEEPSEEKER_STREAM_SPLITTER=0 秒回退。
             result = await handle_chat(
                 messages, model, thinking, False, tools, is_anthropic,
                 req_model, scope, _attempt=_attempt,
@@ -1127,6 +1125,78 @@ def _choice(delta, index=0, finish_reason=None):
     return {"index": index, "delta": delta, "finish_reason": finish_reason}
 
 
+class _StreamTagSplitter:
+    """跨 chunk 安全的 <think> 分离器（真流式零损坏）。
+
+    旧的逐 chunk 状态机对每个分片单独判断 `"</think>" in chunk`：标记
+    一旦跨分片（`</th` + `ink>`）就漏判，状态错乱 → 思考内容泄漏进正文、
+    相邻字节被吞（replace/split 丢字节）、并把 DSML 之类的其它标记
+    切碎直达客户端。
+
+    本实现只在缓冲区里"完整匹配到标记"才处理，并把尾部"可能是标记
+    前缀"的一小段扣留等待后续数据；所有输出字节都取自原文，从不做
+    replace/split。只有 <think>/</think> 的前缀会被扣留——其它以 '<'
+    开头的标记（<｜DSML｜> 工具家族等）一律原样透传，绝不切碎。"""
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self):
+        self.buf = ""
+        self.in_think = False
+        self.think_done = False
+
+    def _hold(self, tag):
+        """把 buf 切成 (可安全输出, 需扣留)。"""
+        if not tag:
+            return self.buf, ""
+        idx = self.buf.rfind("<")
+        if idx == -1:
+            return self.buf, ""
+        suffix = self.buf[idx:]
+        if len(suffix) < len(tag) and tag.startswith(suffix):
+            return self.buf[:idx], suffix
+        return self.buf, ""
+
+    def feed(self, chunk):
+        """返回 [(kind, text)]，kind ∈ {"reasoning", "content"}。"""
+        self.buf += chunk
+        out = []
+        while self.buf:
+            if self.in_think:
+                i = self.buf.find(self.CLOSE)
+                if i == -1:
+                    safe, self.buf = self._hold(self.CLOSE)
+                    if safe:
+                        out.append(("reasoning", safe))
+                    return out
+                if i:
+                    out.append(("reasoning", self.buf[:i]))
+                self.buf = self.buf[i + len(self.CLOSE):]
+                self.in_think = False
+                self.think_done = True
+                continue
+            i = -1 if self.think_done else self.buf.find(self.OPEN)
+            if i == -1:
+                safe, self.buf = self._hold(None if self.think_done else self.OPEN)
+                if safe:
+                    out.append(("content", safe))
+                return out
+            if i:
+                out.append(("content", self.buf[:i]))
+            self.buf = self.buf[i + len(self.OPEN):]
+            self.in_think = True
+            continue
+        return out
+
+    def flush(self):
+        out = []
+        if self.buf:
+            out.append(("reasoning" if self.in_think else "content", self.buf))
+            self.buf = ""
+        return out
+
+
 async def _pseudo_stream(result: dict, model: str):
     """把非流式的完整响应切成 SSE chunk 伪流式吐出（工具轮可靠管线）。
 
@@ -1163,35 +1233,29 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     aborted = False
     failed = False
     try:
-        async for chunk in _hold_think_tags(gen):
+        splitter = _StreamTagSplitter()
+        async for chunk in gen:
             if not chunk:
                 continue
             full_text += chunk
-
-            if "<think>" in chunk:
-                is_thinking = True
-                chunk = chunk.replace("<think>", "").lstrip("\n")
-
-            end_thinking = False
-            if "</think>" in chunk:
-                is_thinking = False
-                end_thinking = True
-                parts = chunk.split("</think>")
-                think_part = parts[0]
-                chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
-                if think_part:
-                    yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': think_part})], cid=cid, created=created, model=model))}\n\n"
-
-            if is_thinking and chunk:
-                yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': chunk})], cid=cid, created=created, model=model))}\n\n"
+            for kind, text in splitter.feed(chunk):
+                if not text:
+                    continue
+                if kind == "reasoning":
+                    yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': text})], cid=cid, created=created, model=model))}\n\n"
+                else:
+                    for r in parser.feed(text):
+                        if "text" in r:
+                            yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
+        for kind, text in splitter.flush():
+            if not text:
                 continue
-
-            if end_thinking and not chunk:
-                continue
-
-            for r in parser.feed(chunk):
-                if "text" in r:
-                    yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
+            if kind == "reasoning":
+                yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': text})], cid=cid, created=created, model=model))}\n\n"
+            else:
+                for r in parser.feed(text):
+                    if "text" in r:
+                        yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
