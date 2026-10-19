@@ -858,7 +858,45 @@ def _code_fence_spans(text):
     return [(m.start(), m.end()) for m in re.finditer(r"```.*?(?:```|$)", text, re.DOTALL)]
 
 
+# [FIX 6] Bare decorated DSML opener without its leading '<': the model
+# occasionally emits "｜｜DSML｜｜ calls>..." (or the half-width/spaced
+# variant "| | DSML | | calls>") missing the opening angle bracket. Every
+# entry regex in this module requires '<', so these fragments used to leak
+# into the chat as prose and the tool never executed (2026-10-20 field
+# evidence: "| | DSML | | calls>" between two successful tool rounds).
+# Repair: a line that is essentially a bare decorated DSML opener gets its
+# '<' prepended and its bars de-spaced/normalized so the entry regex can
+# match. Line-anchored on purpose — prose merely *mentioning* DSML is left
+# untouched.
+_BARE_OPEN_LINE_RE = re.compile(
+    r"(?m)^([ \t]*[｜\|][ \t｜\|]*DSML[ \t｜\|]*(?:calls|invoke|tool_calls?|function_calls?|function_call|parameter)\b[^\n]*)$",
+    re.IGNORECASE,
+)
+
+_BARE_OPEN_HEAD_RE = re.compile(
+    r"^([ \t]*[｜\|][ \t｜\|]*DSML[ \t｜\|]*)([A-Za-z_][A-Za-z0-9_]*)([^\n]*)$",
+    re.IGNORECASE,
+)
+
+
+def _repair_bare_dsml_lines(text):
+    if "DSML" not in text:
+        return text
+
+    def _fix(m):
+        body = m.group(1)
+        mm = _BARE_OPEN_HEAD_RE.match(body)
+        if not mm:
+            return body
+        head, tag, rest = mm.groups()
+        compact = re.sub(r"[ \t]", "", head).replace("|", "｜")
+        return "<" + compact + tag + rest
+
+    return _BARE_OPEN_LINE_RE.sub(_fix, text)
+
+
 def parse_tools(text):
+    text = _repair_bare_dsml_lines(text)
     tools = []
     clean_text = text
     fence_spans = _code_fence_spans(text)
@@ -1218,6 +1256,10 @@ class StreamToolParser:
                         pass
                 break
             else:
+                # [FIX 6] repair bare decorated openers (missing '<') so the
+                # entry regex can catch them instead of leaking as prose.
+                if "DSML" in self.buffer:
+                    self.buffer = _repair_bare_dsml_lines(self.buffer)
                 # [FIX 4] Regex entry detection replaces plain substring finds
                 # so decorated/spaced DSML openers enter tool mode.
                 m = _STREAM_ENTRY_RE.search(self.buffer)
