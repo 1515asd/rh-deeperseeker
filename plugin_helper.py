@@ -298,6 +298,35 @@ async def extract_system(messages):
     return None
 
 
+_TOOL_RULES = """【工具调用铁律】
+1. 调用任何工具前，逐项核对：所有标注 [必填] 的参数都已填入具体的、非空的值。
+2. 绝对禁止输出参数为空、缺失或只填空字符串的调用——这类调用会被直接拒绝，任务失败。
+3. 若无法确定某个必填参数的值，先用文字向用户询问，不要输出空参数的调用。
+4. 正确示例：<tool_call>{"name": "web_search", "arguments": {"query": "2026年油价"}}</tool_call>（query 填了具体值）
+   禁止示例：<tool_call>{"name": "web_search", "arguments": {}}</tool_call> 或 {"query": ""}（参数空，会被拒绝）
+"""
+
+
+def _render_tool_block(name, desc, params):
+    """把单个工具 schema 渲染成带必填标注的说明（比裸 JSON 对模型友好）。"""
+    params = params or {}
+    props = params.get("properties", {}) or {}
+    required = params.get("required", []) or []
+    lines = [f"Tool: {name}", f"Description: {desc}"]
+    if props:
+        lines.append("Parameters:")
+        for pname, pinfo in props.items():
+            if isinstance(pinfo, dict):
+                ptype = pinfo.get("type", "any")
+                pdesc = str(pinfo.get("description", ""))[:120]
+            else:
+                ptype, pdesc = "any", str(pinfo)[:120]
+            mark = " [必填]" if pname in required else " [可选]"
+            lines.append(f"  - {pname} ({ptype}){mark}: {pdesc}")
+    lines.append(f"Parameters JSON Schema: {json.dumps(params)}")
+    return "\n".join(lines)
+
+
 async def extract_tools(tools):
     if not tools:
         return None
@@ -308,17 +337,20 @@ async def extract_tools(tools):
             name = fn.get("name", "")
             desc = fn.get("description", "")
             params = fn.get("parameters", {})
-            final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
+            final_tools.append(_render_tool_block(name, desc, params))
         elif "name" in i:
             name = i.get("name", "")
             desc = i.get("description", "")
             params = i.get("input_schema", i.get("parameters", {}))
-            final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
+            final_tools.append(_render_tool_block(name, desc, params))
         elif i.get("type") in ["computer_use", "text_editor", "bash"]:
             final_tools.append(f"Tool: {i['type']}\nDescription: {json.dumps(i)}")
         else:
             final_tools.append(f"Tool: {json.dumps(i)}")
-    return "\n\n".join(final_tools) if final_tools else None
+    body = "\n\n".join(final_tools) if final_tools else None
+    if body:
+        body = _TOOL_RULES + "\n" + body
+    return body
 
 
 async def extract_tool_results(messages, latest_only=False):
