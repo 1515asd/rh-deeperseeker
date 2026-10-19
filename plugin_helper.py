@@ -152,6 +152,34 @@ def needs_rollover(messages, baseline=0):
     return False
 
 
+RESUME_NOTICE = (
+    "[上下文说明] 上一条回复因故中断，未完整送达。历史记录中此前的一切指令与任务"
+    "均视为已中止：不要继续、不要询问差异。请直接执行下面这条最新指令——它是唯一的当前任务。\n\n"
+)
+
+
+def resume_candidate_messages(messages):
+    """Prefix candidates for interrupted-turn recovery.
+
+    Applies only when the history ends WITHOUT an assistant reply — the
+    fingerprint of a client that lost the last answer (user stop, timeout).
+    Yields the history with 1..4 trailing unanswered user/tool messages
+    stripped; each prefix hashes to the signature stored when the previous
+    turn completed. Never fires for a history that already ends with an
+    assistant reply (normal continuations and edits keep exact matches)."""
+    if not messages or messages[-1].get("role") == "assistant":
+        return []
+    out = []
+    for strip in range(1, 5):
+        prefix = messages[: len(messages) - strip]
+        if not prefix:
+            break
+        last = prefix[-1].get("role", "")
+        if last == "assistant" and any(m.get("role") == "assistant" for m in prefix[:-1]):
+            out.append(prefix)
+    return out
+
+
 def _messages_plain_text(messages):
     parts = []
     for m in messages:
