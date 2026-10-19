@@ -591,8 +591,42 @@ def generate_signature_sync(messages, model, scope=""):
     return hashlib.sha256(f"{model}_{scope}_{dump}".encode("utf-8")).hexdigest()
 
 
+# ── Signature cache ───────────────────────────────────────────────────────
+# Same idea as the estimate cache: a 1.5M-char history costs ~0.5-2s of CPU
+# to canonicalize + dump + hash, twice per request (incoming sig + stored
+# next_sig). Normal chat resends the identical truncated history each turn,
+# so cache per-exact-input signatures keyed by the fast full-content hash
+# (~10ms) and skip the dump entirely on a hit.
+_SIG_CACHE: "_OrderedDict[str, str]" = _OrderedDict()
+_SIG_CACHE_MAX = 512
+
+
+def _sig_cache_put(messages, model, scope, sig):
+    _SIG_CACHE[_msgs_key(messages) + f"|{model}|{scope}"] = sig
+    _SIG_CACHE.move_to_end(_msgs_key(messages) + f"|{model}|{scope}")
+    while len(_SIG_CACHE) > _SIG_CACHE_MAX:
+        _SIG_CACHE.popitem(last=False)
+
+
+def generate_signature_cached(messages, model, scope=""):
+    last_ast_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            last_ast_idx = i
+            break
+    trunc = messages if last_ast_idx == -1 else messages[: last_ast_idx + 1]
+    key = _msgs_key(trunc) + f"|{model}|{scope}"
+    cached = _SIG_CACHE.get(key)
+    if cached is not None:
+        _SIG_CACHE.move_to_end(key)
+        return cached
+    sig = generate_signature_sync(messages, model, scope)
+    _sig_cache_put(trunc, model, scope, sig)
+    return sig
+
+
 async def generate_signature(messages, model, scope=""):
-    return generate_signature_sync(messages, model, scope)
+    return generate_signature_cached(messages, model, scope)
 
 
 async def build_prompt(messages, tools, model, is_first_message=False, rollover_summary=None):
