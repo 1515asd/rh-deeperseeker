@@ -159,25 +159,26 @@ RESUME_NOTICE = (
 
 
 def resume_candidate_messages(messages):
-    """Prefix candidates for interrupted-turn recovery.
+    """Resume candidate — STRICT canonical interruption shape only.
 
-    Applies only when the history ends WITHOUT an assistant reply — the
-    fingerprint of a client that lost the last answer (user stop, timeout).
-    Yields the history with 1..4 trailing unanswered user/tool messages
-    stripped; each prefix hashes to the signature stored when the previous
-    turn completed. Never fires for a history that already ends with an
-    assistant reply (normal continuations and edits keep exact matches)."""
-    if not messages or messages[-1].get("role") == "assistant":
-        return []
-    out = []
-    for strip in range(1, 5):
-        prefix = messages[: len(messages) - strip]
-        if not prefix:
-            break
-        last = prefix[-1].get("role", "")
-        if last == "assistant" and any(m.get("role") == "assistant" for m in prefix[:-1]):
-            out.append(prefix)
-    return out
+    Fires when the history ends with exactly ONE unanswered user message
+    directly after an assistant reply: the client lost the last generation
+    (user stop / timeout) and resends with that reply missing. The returned
+    prefix re-attaches to the ORIGINAL chat and only the new command is sent.
+
+    Anything else — modified history, or two or more trailing user commands
+    stacked ("old command + new command") — yields NO candidate and falls
+    back to the fresh-chat full pack (nothing is lost, v7 behavior): a
+    mismatched history must never be replayed into a chat that may have
+    already acted on the old command."""
+    if (
+        len(messages) >= 3
+        and messages[-1].get("role") == "user"
+        and messages[-2].get("role") == "assistant"
+        and any(m.get("role") == "assistant" for m in messages[:-2])
+    ):
+        return [messages[:-1]]
+    return []
 
 
 def _messages_plain_text(messages):
