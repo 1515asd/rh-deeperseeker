@@ -931,6 +931,28 @@ async def handle_chat(
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
+        if stream and tools and not is_anthropic:
+            # 工具轮走可靠的非流式管线，结果伪流式吐出。
+            # 背景：流式透传路径的 think/DSML 标记解析在真实负载上会产生
+            # 内容损坏（思考泄漏进正文、DSML 工具标记碎裂直达客户端、
+            # 工具循环卡死，2026-10-20 截图实锤）；非流式管线（全文聚齐
+            # 后 parse_tools + 剥离）实测 100% 可靠。代价：首字节要等
+            # 官网生成完毕（与客户端感知的"输出完"一致）。
+            result = await handle_chat(
+                messages, model, thinking, False, tools, is_anthropic,
+                req_model, scope, _attempt=_attempt,
+                _auth_rotated=_auth_rotated, _exclude_token=_exclude_token,
+            )
+            try:
+                body = json.loads(bytes(result.body).decode("utf-8"))
+            except Exception:
+                return result
+            if "choices" not in body:
+                return result  # 上游错误原样透传
+            return StreamingResponse(
+                _pseudo_stream(body, model),
+                media_type="text/event-stream",
+            )
         if stream:
             gen = _release_chat_lock_stream(gen, lock_owner, slot)
             lock_transferred = True
@@ -1103,6 +1125,28 @@ def _chat_chunk(choices, cid, created, model):
 
 def _choice(delta, index=0, finish_reason=None):
     return {"index": index, "delta": delta, "finish_reason": finish_reason}
+
+
+async def _pseudo_stream(result: dict, model: str):
+    """把非流式的完整响应切成 SSE chunk 伪流式吐出（工具轮可靠管线）。
+
+    一次性给完 tool_calls（OpenAI 流式允许参数整体到达）；正文分 8 片，
+    片间微延迟让客户端有流式观感。"""
+    cid = "chatcmpl-" + uuid.uuid4().hex
+    created = int(time.time())
+    choice = result["choices"][0]
+    msg = choice.get("message", {})
+    fin = choice.get("finish_reason") or "stop"
+    content = msg.get("content") or ""
+    if msg.get("reasoning_content"):
+        yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': msg['reasoning_content']})], cid=cid, created=created, model=model))}\n\n"
+    step = max(1, len(content) // 8)
+    for i in range(0, len(content), step):
+        yield f"data: {json.dumps(_chat_chunk([_choice({'content': content[i:i + step]})], cid=cid, created=created, model=model))}\n\n"
+    if msg.get("tool_calls"):
+        yield f"data: {json.dumps(_chat_chunk([_choice({'tool_calls': msg['tool_calls']})], cid=cid, created=created, model=model))}\n\n"
+    yield f"data: {json.dumps(_chat_chunk([_choice({}, finish_reason=fin)], cid=cid, created=created, model=model))}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope=""):
