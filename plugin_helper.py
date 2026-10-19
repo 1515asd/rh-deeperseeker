@@ -83,13 +83,12 @@ def needs_rollover(messages, baseline=0):
         return False
     total = estimate_conversation_tokens(messages)
     if baseline and baseline > 0:
-        # Growth trigger AND absolute cap. With a large first message (e.g.
-        # a 300K-token packed history), growth alone would let the total run
-        # far past the upstream ~393K remembered-context line — the web
-        # backend silently forgets the oldest content at that line, well
-        # before a growth-only rollover would fire. Fire on whichever comes
-        # first so the handoff always precedes silent forgetting.
-        return (total - baseline) > context_window_tokens() or total > context_window_tokens()
+        # baseline = the size of THIS chat's first packed message; growth
+        # since then approximates the in-session accumulated context, which
+        # is what the web backend's ~393K sliding window forgets. (Never
+        # compare against the client-side total history: it monotonically
+        # grows across rollovers and would fire on every request.)
+        return (total - baseline) > context_window_tokens()
     return total > context_window_tokens()
 
 

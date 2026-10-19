@@ -117,8 +117,18 @@ from plugin_helper import (
     max_output_tokens,
     needs_rollover,
     strip_summary_tags,
+    MAX_HISTORY_TOKENS,
     MAX_SUMMARY_TOKENS,
 )
+
+
+def _packed_first_message_tokens(messages) -> int:
+    """Size of what build_prompt actually packs into THIS chat's first
+    message: the full client history, capped at MAX_HISTORY_TOKENS. Used as
+    the chat baseline so the rollover growth-trigger measures in-session
+    accumulation from the real packed start. (The client-side total history
+    grows monotonically across rollovers and must never be the anchor.)"""
+    return min(estimate_conversation_tokens(messages), MAX_HISTORY_TOKENS)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -714,7 +724,7 @@ async def handle_chat(
                         next_sig = await generate_signature(next_messages, model, scope)
 
                         await _db(save_session, sig, new_token_id, new_session_id, next_parent(0))
-                        await _db(set_chat_baseline, new_session_id, estimate_conversation_tokens(messages))
+                        await _db(set_chat_baseline, new_session_id, _packed_first_message_tokens(messages))
                         await _db(save_session, next_sig, new_token_id, new_session_id, next_parent(0))
                         if rot_owner is not None:
                             rot_owner.release()
@@ -779,7 +789,7 @@ async def handle_chat(
 
                 session_id = await create_new_chat(tok["token"])
                 await _db(save_session, sig, token_id, session_id, 0)
-                await _db(set_chat_baseline, session_id, estimate_conversation_tokens(messages))
+                await _db(set_chat_baseline, session_id, _packed_first_message_tokens(messages))
                 parent_message_id = 0
             else:
                 token_id = sess["token_id"]
@@ -848,7 +858,7 @@ async def handle_chat(
             rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
             session_id = await create_new_chat(tok["token"])
             await _db(save_session, sig, token_id, session_id, 0)
-            await _db(set_chat_baseline, session_id, estimate_conversation_tokens(messages))
+            await _db(set_chat_baseline, session_id, len(rollover_summary) // 3 + estimate_conversation_tokens(messages[-1:]))
             parent_message_id = 0
             # The rollover itself was serialized under the OLD chat's lock;
             # the send -> save section below must hold the FRESH chat's lock.
