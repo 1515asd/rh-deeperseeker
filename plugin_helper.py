@@ -89,7 +89,12 @@ def needs_rollover(messages, baseline=0):
         # compare against the client-side total history: it monotonically
         # grows across rollovers and would fire on every request.)
         return (total - baseline) > context_window_tokens()
-    return total > context_window_tokens()
+    # No baseline = this chat has no packed first message yet. The first
+    # message rides the upstream first-message channel (observed ~975K
+    # tokens accepted, and NOT subject to the sliding-window forgetting),
+    # so a large client history must be packed verbatim, never pre-summarized
+    # into a lossy 4K handoff. Summarize only from in-session growth onward.
+    return False
 
 
 def _messages_plain_text(messages):
