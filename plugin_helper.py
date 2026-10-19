@@ -68,7 +68,7 @@ import json as _json
 from collections import OrderedDict as _OrderedDict
 
 _EST_CACHE: " _OrderedDict[str, int]" = _OrderedDict()
-_EST_CACHE_MAX = 512
+_EST_CACHE_MAX = 4096
 
 
 def _msgs_key(messages) -> str:
@@ -598,7 +598,7 @@ def generate_signature_sync(messages, model, scope=""):
 # so cache per-exact-input signatures keyed by the fast full-content hash
 # (~10ms) and skip the dump entirely on a hit.
 _SIG_CACHE: "_OrderedDict[str, str]" = _OrderedDict()
-_SIG_CACHE_MAX = 512
+_SIG_CACHE_MAX = 4096
 
 
 def _sig_cache_put(messages, model, scope, sig):
