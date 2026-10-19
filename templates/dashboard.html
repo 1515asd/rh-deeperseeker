@@ -17,41 +17,36 @@
         <p>打开开发者工具（F12）→ 控制台（Console）→ 粘贴：</p>
         <code>JSON.parse(localStorage.getItem("userToken")).value</code>
 
-        <p><strong>方式 B · iPhone / iPad（Safari 书签小工具）</strong></p>
-        <p>iOS 上没有 F12 控制台，而且 Safari <strong>不允许</strong>在地址栏直接执行 <code>javascript:</code>——只能用书签跑脚本：</p>
+        <p><strong>方式 B · iPhone / iPad（快捷指令）—— 推荐，实测可用</strong></p>
+        <p>用快捷指令的「在网页上运行 JavaScript」提取。它有完整页面权限，<strong>不会</strong>像书签那样被 iOS 报「The operation is insecure」：</p>
         <ol>
-            <li>Safari 打开任意一个普通页面 → 点<strong>分享</strong> → <strong>添加到书签</strong> → 存储</li>
-            <li>打开<strong>书签列表</strong> → <strong>编辑</strong>刚存的那条 → 把「地址」整段替换成下面这段代码（名称改成好认的，比如「取令牌」）→ 存储</li>
-            <li>在 <strong>chat.deepseek.com</strong>（已登录、页面完全加载后）→ 点书签图标 → 点「取令牌」→ 令牌自动复制到剪贴板并弹窗显示</li>
+            <li>快捷指令 App → 右上角 <strong>+</strong> 新建 → 添加操作「<strong>在网页上运行 JavaScript</strong>」→ 脚本框粘贴：</li>
         </ol>
-        <pre style="white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:10px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto"><code>javascript:(function(){var t='';try{var r=localStorage.getItem('userToken');if(r){try{t=JSON.parse(r).value||r;}catch(e){t=r;}}}catch(e){alert('读取失败: '+e.message);return;}if(!t||t.length&lt;20){alert('未找到 userToken。请确认已登录 chat.deepseek.com 且页面已加载完成');return;}var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();a.setSelectionRange(0,999999);var ok=document.execCommand('copy');a.remove();alert((ok?'已复制到剪贴板 ✓\n\n':'复制失败，请手动长按复制\n\n')+'长度 '+t.length+'\n'+t.substring(0,12)+'...');})();</code></pre>
-
-        <ol start="4">
-            <li>复制令牌并粘贴到下方</li>
-            <li><strong>去掉两侧的引号</strong>——只粘贴令牌字符串本身</li>
-            <li><strong>关闭无痕窗口</strong>（保留浏览器里的登录状态）</li>
-        </ol>
-        <details style="margin-top:10px">
-            <summary style="cursor:pointer;font-weight:bold">📱 iPhone 上书签报「The operation is insecure」？用快捷指令（推荐，已实测成功）</summary>
-            <div style="padding:8px 12px">
-                <p>iOS Safari 的书签脚本可能被系统禁掉 localStorage（报 SecurityError，与「阻止所有 Cookie」无关）。用<strong>快捷指令</strong>的「在网页上运行 JavaScript」有完整页面权限，不受此限制：</p>
-                <ol>
-                    <li>快捷指令 App → 新建 → 添加操作「<strong>在网页上运行 JavaScript</strong>」→ 脚本框粘贴：</li>
-                </ol>
-                <pre style="white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:10px;border-radius:6px;font-size:12px"><code>var out = '';
+        <pre style="white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:10px;border-radius:6px;font-size:12px"><code>var out = '';
 try {
   var r = localStorage.getItem('userToken');
   if (r) { try { out = JSON.parse(r).value || r; } catch(e) { out = r; } }
 } catch(e) { out = ''; }
 if (out) { completion(out); } else { completion('未取到：请确认 Safari 已登录 chat.deepseek.com'); }</code></pre>
-                <ol start="2">
-                    <li>再添加操作「<strong>拷贝至剪贴板</strong>」</li>
-                    <li><strong>关键</strong>：编辑快捷指令底部「接收」→ 类型选「<strong>Safari 网页</strong>」，并确认 JS 操作的「网页」输入已连上上一步（没连上会"运行完没结果"）</li>
-                    <li>使用：Safari 打开已登录的 chat.deepseek.com → <strong>分享</strong> → 运行快捷指令 → 令牌进剪贴板</li>
+        <ol start="2">
+            <li>再添加操作「<strong>拷贝至剪贴板</strong>」</li>
+            <li><strong>关键一步（漏了会“运行完没结果”）</strong>：编辑快捷指令底部「接收」→ 类型选「<strong>Safari 网页</strong>」，并确认 JS 操作的「网页」输入已连上上一步</li>
+            <li>使用：Safari 打开已登录的 <strong>chat.deepseek.com</strong>（页面完全加载后）→ 点<strong>分享</strong> → <strong>运行快捷指令</strong> → 令牌进剪贴板并弹窗</li>
+        </ol>
+
+        <details style="margin-top:10px">
+            <summary style="cursor:pointer">方式 C · Safari 书签小工具（备选：部分 iOS 会报 The operation is insecure，报错就用方式 B）</summary>
+            <div style="padding:8px 12px">
+                <p>iOS 不允许在地址栏直接执行 <code>javascript:</code>，书签是唯一入口。但部分 iOS 会禁掉书签脚本的 localStorage 读取（报 SecurityError，与「阻止所有 Cookie」设置无关）——报错请改用方式 B。</p>
+                <ol>
+                    <li>Safari 打开任意普通页面 → <strong>分享</strong> → <strong>添加到书签</strong> → 存储</li>
+                    <li>书签列表 → <strong>编辑</strong>该条 → 「地址」整段替换为下面的代码 → 存储</li>
+                    <li>在已登录的 chat.deepseek.com 页面点书签运行 → 自动复制</li>
                 </ol>
+                <pre style="white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:10px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto"><code>javascript:(function(){var t='';try{var r=localStorage.getItem('userToken');if(r){try{t=JSON.parse(r).value||r;}catch(e){t=r;}}}catch(e){alert('读取失败: '+e.message+'（请改用方式 B 快捷指令）');return;}if(!t||t.length&lt;20){alert('未找到 userToken。请确认已登录且页面加载完成');return;}var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();a.setSelectionRange(0,999999);var ok=document.execCommand('copy');a.remove();alert((ok?'已复制到剪贴板 ✓\n\n':'复制失败，请手动长按复制\n\n')+'长度 '+t.length+'\n'+t.substring(0,12)+'...');})();</code></pre>
             </div>
         </details>
-        <p class="hint">安卓也可以用方式 B 的书签（新版 Chrome 同样禁止在地址栏执行 <code>javascript:</code>），或继续用 F12 控制台。</p>
+        <p class="hint">安卓也可以用方式 C 的书签（新版 Chrome 同样禁止在地址栏执行 <code>javascript:</code>），或继续用 F12 控制台。</p>
     </div>
     <div class="warning">
         注意：如果你在浏览器里退出 DeepSeek 登录，此令牌会随之失效。
