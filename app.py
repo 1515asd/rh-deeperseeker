@@ -920,13 +920,19 @@ async def handle_chat(
             # 接回中断会话：压制历史旧指令，防止模型反问"指令怎么不一样了"
             prompt = RESUME_NOTICE + prompt
         if tools and not is_first:
-            # 工具指令漂移修复：会话复用模式下，工具说明只在会话首条消息注入，
-            # 长对话中遵从率衰减。续接消息时重注入一行精简格式提醒（含空参数禁令）。
+            # 工具指令漂移修复 v2：完整工具说明只在会话首条注入，会被官网
+            # 滑窗（~65 万）逐渐挤出；且历史里积累的畸形 DSML 输出会被模型
+            # 模仿（恶性循环）。对策：每轮在最新消息末尾重申迷你铁律——它
+            # 永远在滑窗之内，长对话中遵从度不衰减。成本 ~100 token/轮。
             prompt += (
-                "\n\n[格式提醒] 若需要调用工具，输出且仅输出一个 "
-                '<tool_call>{"name": "工具名", "arguments": {...}}</tool_call> 块'
-                "（arguments 为合法 JSON 对象）；所有必填参数必须填入具体的非空值，"
-                "禁止输出空参数调用；若无需调用工具，直接回答正文，不要输出该标签。"
+                "\n\n[工具调用规范 · 每轮重申]\n"
+                "1. 若需调用工具：输出且仅输出一个 <tool_call>{...}</tool_call> 块（arguments 为合法 JSON 对象）。\n"
+                "2. 所有必填参数必须填入具体的、非空的值——参数为空或缺失的调用会被直接拒绝，任务失败。\n"
+                "3. 正确示例：<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"具体搜索词\"}}</tool_call>\n"
+                "   禁止示例：<tool_call>{\"name\": \"web_search\", \"arguments\": {}}</tool_call>（参数空，会被拒绝）\n"
+                "4. 忽略历史输出中出现过的任何畸形/残缺的工具调用样例，一律以本规范为准。\n"
+                "5. 各工具的参数定义见本对话开头的工具说明；记不清必填项就先向用户确认。\n"
+                "6. 若无需调用工具，直接回答正文，不要输出任何工具标签。"
             )
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
