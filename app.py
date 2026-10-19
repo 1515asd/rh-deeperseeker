@@ -25,6 +25,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _dump_stream_debug(session_id: str, text: str, kind: str = "stream"):
+    """DEEPSEEKER_STREAM_DEBUG=1 时，把官网返回的原始聚合文本落盘，
+    用于定位流式损坏发生在哪一环（官网输出 / 服务端处理 / 客户端显示）。
+    只保留最近 20 份，防止磁盘累积。"""
+    if os.getenv("DEEPSEEKER_STREAM_DEBUG") != "1" or not text:
+        return
+    try:
+        d = os.path.join(BASE_DIR, "debug_streams")
+        os.makedirs(d, exist_ok=True)
+        fn = os.path.join(d, f"{int(time.time())}_{kind}_{str(session_id)[:8]}.txt")
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(text)
+        files = sorted(f for f in os.listdir(d) if f.endswith(".txt"))
+        for old in files[:-20]:
+            try:
+                os.remove(os.path.join(d, old))
+            except OSError:
+                pass
+    except Exception:
+        pass
 # B12 (Stage 1 audit): the global os.chdir(BASE_DIR) is gone — every relative
 # path resolves from BASE_DIR explicitly. Import-time process-wide state is
 # hostile to embedding, multi-worker setups and packaging.
@@ -965,6 +987,7 @@ async def handle_chat(
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
         else:
             resp_text = await collect_response(gen)
+            _dump_stream_debug(session_id, resp_text)
             await _db(mark_active, token_id)
 
             parsed_tools, clean_text = parse_tools(resp_text)
@@ -1262,6 +1285,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 for r in parser.feed(text):
                     if "text" in r:
                         yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
+        _dump_stream_debug(session_id, full_text)
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
