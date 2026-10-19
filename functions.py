@@ -138,7 +138,19 @@ async def get_session():
         async with _session_lock:
             if _session is None or _session.closed:
                 logger.info("Opening shared aiohttp ClientSession")
-                _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600))
+                # 长保活连接池：默认 keepalive 15s 太短——用户打字/思考的间隔
+                # 普遍超过它，导致每轮都重新 TLS 握手（1-2s）。10 分钟保活 +
+                # DNS 缓存，把连续对话稳定在已热连接上（内存代价 ~几 MB socket）。
+                connector = aiohttp.TCPConnector(
+                    limit=64,
+                    keepalive_timeout=600,
+                    ttl_dns_cache=300,
+                    use_dns_cache=True,
+                )
+                _session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600),
+                )
     return _session
 
 
