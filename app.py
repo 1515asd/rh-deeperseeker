@@ -120,6 +120,8 @@ from plugin_helper import (
     MAX_HISTORY_TOKENS,
     MAX_SUMMARY_TOKENS,
     estimate_conversation_tokens_cached,
+    resume_candidate_messages,
+    RESUME_NOTICE,
 )
 
 
@@ -648,6 +650,23 @@ async def handle_chat(
 
     sig = await generate_signature(messages, model, scope)
     sess = await _db(find_session, sig)
+    resume_recovered = False
+    if not sess and os.getenv("DEEPSEEKER_RESUME_MATCH", "1") == "1":
+        # Interrupted-turn recovery: when the client walks away mid-generation
+        # (user stop / client timeout), the resent history is missing the last
+        # assistant turn, so the exact signature misses and a fresh chat would
+        # re-pack the whole history. Strip trailing unanswered turns and retry
+        # the prefix signature: a hit re-attaches to the ORIGINAL chat with
+        # its full upstream memory intact.
+        for cand in resume_candidate_messages(messages):
+            sess = await _db(find_session, await generate_signature(cand, model, scope))
+            if sess:
+                resume_recovered = True
+                logger.info(
+                    "Resume recovery: re-attached to chat %s after interrupted turn",
+                    str(sess.get("session_id", ""))[:8],
+                )
+                break
     rollover_summary = None
     ref_ids = []  # B4: file ids referenced by the conversation (set by the create path)
 
@@ -897,6 +916,9 @@ async def handle_chat(
                 if fid not in ref_set:
                     await _db(record_file, fid, token_id)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
+        if resume_recovered and not is_first:
+            # 接回中断会话：压制历史旧指令，防止模型反问"指令怎么不一样了"
+            prompt = RESUME_NOTICE + prompt
         if tools and not is_first:
             # 工具指令漂移修复：会话复用模式下，工具说明只在会话首条消息注入，
             # 长对话中遵从率衰减。续接消息时重注入一行精简格式提醒。
