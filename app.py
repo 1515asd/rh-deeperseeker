@@ -921,12 +921,12 @@ async def handle_chat(
             prompt = RESUME_NOTICE + prompt
         if tools and not is_first:
             # 工具指令漂移修复：会话复用模式下，工具说明只在会话首条消息注入，
-            # 长对话中遵从率衰减。续接消息时重注入一行精简格式提醒。
+            # 长对话中遵从率衰减。续接消息时重注入一行精简格式提醒（含空参数禁令）。
             prompt += (
                 "\n\n[格式提醒] 若需要调用工具，输出且仅输出一个 "
                 '<tool_call>{"name": "工具名", "arguments": {...}}</tool_call> 块'
-                "（arguments 为合法 JSON 对象）；若无需调用工具，直接回答正文，"
-                "不要输出该标签。"
+                "（arguments 为合法 JSON 对象）；所有必填参数必须填入具体的非空值，"
+                "禁止输出空参数调用；若无需调用工具，直接回答正文，不要输出该标签。"
             )
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
