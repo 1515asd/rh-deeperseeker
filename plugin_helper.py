@@ -58,6 +58,61 @@ def estimate_conversation_tokens(messages):
     return _count_tokens(_messages_plain_text(messages))
 
 
+# ── Incremental estimate cache ────────────────────────────────────────────
+# Full re-counting of a multi-hundred-K-token history on EVERY request costs
+# seconds of CPU before the first upstream byte. Normal chat resends the
+# same prefix each turn, so cache per-prefix estimates and reuse the longest
+# cached prefix; only the newly appended messages get tokenized.
+import hashlib as _hashlib
+import json as _json
+from collections import OrderedDict as _OrderedDict
+
+_EST_CACHE: " _OrderedDict[str, int]" = _OrderedDict()
+_EST_CACHE_MAX = 512
+
+
+def _msgs_key(messages) -> str:
+    h = _hashlib.sha256()
+    for m in messages:
+        h.update(b"\x00")
+        h.update(m.get("role", "").encode("utf-8", "ignore"))
+        c = m.get("content", "")
+        blob = c if isinstance(c, str) else _json.dumps(c, ensure_ascii=False)
+        h.update(blob.encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
+def estimate_conversation_tokens_cached(messages):
+    """estimate_conversation_tokens with a longest-cached-prefix fast path.
+
+    Hashing the full history is ~10ms (hashlib) versus seconds for the
+    tokenizer, so the key itself is recomputed every time — correctness
+    never depends on trusting the client. On a hit only the tail messages
+    (usually a few hundred tokens) are tokenized; misses fall back to the
+    full estimate and prime the cache for the next turn."""
+    n = len(messages)
+    for back in range(0, min(8, n) + 1):
+        prefix = messages[: n - back] if back else messages
+        key = _msgs_key(prefix)
+        cached = _EST_CACHE.get(key)
+        if cached is None:
+            continue
+        est = cached
+        if back:
+            est += estimate_conversation_tokens(messages[n - back :])
+        _EST_CACHE[key if not back else _msgs_key(messages)] = est
+        _EST_CACHE.move_to_end(_msgs_key(messages))
+        while len(_EST_CACHE) > _EST_CACHE_MAX:
+            _EST_CACHE.popitem(last=False)
+        return est
+    est = estimate_conversation_tokens(messages)
+    _EST_CACHE[_msgs_key(messages)] = est
+    _EST_CACHE.move_to_end(_msgs_key(messages))
+    while len(_EST_CACHE) > _EST_CACHE_MAX:
+        _EST_CACHE.popitem(last=False)
+    return est
+
+
 def needs_rollover(messages, baseline=0):
     """Decide keep-current-chat vs summarize-and-roll-over.
 
@@ -81,7 +136,7 @@ def needs_rollover(messages, baseline=0):
         m.get("role") == "tool" for m in non_system
     ):
         return False
-    total = estimate_conversation_tokens(messages)
+    total = estimate_conversation_tokens_cached(messages)
     if baseline and baseline > 0:
         # baseline = the size of THIS chat's first packed message; growth
         # since then approximates the in-session accumulated context, which

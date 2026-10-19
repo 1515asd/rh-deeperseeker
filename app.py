@@ -119,6 +119,7 @@ from plugin_helper import (
     strip_summary_tags,
     MAX_HISTORY_TOKENS,
     MAX_SUMMARY_TOKENS,
+    estimate_conversation_tokens_cached,
 )
 
 
@@ -128,7 +129,7 @@ def _packed_first_message_tokens(messages) -> int:
     the chat baseline so the rollover growth-trigger measures in-session
     accumulation from the real packed start. (The client-side total history
     grows monotonically across rollovers and must never be the anchor.)"""
-    return min(estimate_conversation_tokens(messages), MAX_HISTORY_TOKENS)
+    return min(estimate_conversation_tokens_cached(messages), MAX_HISTORY_TOKENS)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -858,7 +859,7 @@ async def handle_chat(
             rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
             session_id = await create_new_chat(tok["token"])
             await _db(save_session, sig, token_id, session_id, 0)
-            await _db(set_chat_baseline, session_id, len(rollover_summary) // 3 + estimate_conversation_tokens(messages[-1:]))
+            await _db(set_chat_baseline, session_id, len(rollover_summary) // 3 + estimate_conversation_tokens_cached(messages[-1:]))
             parent_message_id = 0
             # The rollover itself was serialized under the OLD chat's lock;
             # the send -> save section below must hold the FRESH chat's lock.
