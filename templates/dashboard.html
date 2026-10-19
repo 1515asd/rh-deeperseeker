@@ -10,14 +10,28 @@
         <ol>
             <li>打开浏览器<strong>无痕/隐私窗口</strong></li>
             <li>访问 <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> 并登录</li>
-            <li>打开开发者工具（F12）→ 控制台（Console）→ 粘贴：</li>
+            <li>提取令牌 —— <strong>按你的设备选一种方式</strong>（两套都保留，用哪套都行）：</li>
         </ol>
+
+        <p><strong>方式 A · 电脑 / 安卓（有开发者工具）</strong></p>
+        <p>打开开发者工具（F12）→ 控制台（Console）→ 粘贴：</p>
         <code>JSON.parse(localStorage.getItem("userToken")).value</code>
+
+        <p><strong>方式 B · iPhone / iPad（Safari 书签小工具）</strong></p>
+        <p>iOS 上没有 F12 控制台，而且 Safari <strong>不允许</strong>在地址栏直接执行 <code>javascript:</code>——只能用书签跑脚本：</p>
+        <ol>
+            <li>Safari 打开任意一个普通页面 → 点<strong>分享</strong> → <strong>添加到书签</strong> → 存储</li>
+            <li>打开<strong>书签列表</strong> → <strong>编辑</strong>刚存的那条 → 把「地址」整段替换成下面这段代码（名称改成好认的，比如「取令牌」）→ 存储</li>
+            <li>在 <strong>chat.deepseek.com</strong>（已登录、页面完全加载后）→ 点书签图标 → 点「取令牌」→ 令牌自动复制到剪贴板并弹窗显示</li>
+        </ol>
+        <pre style="white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:10px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto"><code>javascript:(function(){var t='';try{var r=localStorage.getItem('userToken');if(r){try{t=JSON.parse(r).value||r;}catch(e){t=r;}}}catch(e){alert('读取失败: '+e.message);return;}if(!t||t.length&lt;20){alert('未找到 userToken。请确认已登录 chat.deepseek.com 且页面已加载完成');return;}var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();a.setSelectionRange(0,999999);var ok=document.execCommand('copy');a.remove();alert((ok?'已复制到剪贴板 ✓\n\n':'复制失败，请手动长按复制\n\n')+'长度 '+t.length+'\n'+t.substring(0,12)+'...');})();</code></pre>
+
         <ol start="4">
             <li>复制令牌并粘贴到下方</li>
             <li><strong>去掉两侧的引号</strong>——只粘贴令牌字符串本身</li>
             <li><strong>关闭无痕窗口</strong>（保留浏览器里的登录状态）</li>
         </ol>
+        <p class="hint">安卓也可以用方式 B 的书签（新版 Chrome 同样禁止在地址栏执行 <code>javascript:</code>），或继续用 F12 控制台。</p>
     </div>
     <div class="warning">
         注意：如果你在浏览器里退出 DeepSeek 登录，此令牌会随之失效。

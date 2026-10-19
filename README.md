@@ -16,6 +16,33 @@ Use at your own risk.
 A kind request: do not spam the server, respect DeepSeek's limits, and use it for personal purposes only.
 
 
+## Fork Improvements (this fork)
+
+This fork is maintained for **long-running, self-hosted deployments on free-tier
+platforms**. On top of upstream [`AmanCode22/deeperseeker`](https://github.com/AmanCode22/deeperseeker)
+(MIT licensed), the following work has been done:
+
+| # | Improvement | Commit |
+|---|---|---|
+| 1 | **Belmo platform adaptation** — bind `HOST=0.0.0.0`, drop the Playwright/Chromium dependency (saves RAM, removes the cookie-harvesting code path) | `a658b98` |
+| 2 | **Stream-interrupt auto-continue** — detect an abnormal SSE stream end mid-generation and transparently resume, so long answers no longer truncate | `43396bc`, `9ca7ebe` |
+| 3 | **Tool-call format reminder re-injection** — keep multi-step tool workflows from drifting off-format on very long contexts | `43396bc` |
+| 4 | **Anti-"memory-loss" tuning** — handoff summary budget x4 and a proactive handoff 58k tokens before the context window closes | `a658b98` |
+| 5 | **Chinese localisation** of the dashboard / login / base templates | `08985fe`, `15b98c4`, `70cf4ef` |
+| 6 | **Token-pool disaster recovery (`ds_backup.py`)** — encrypted off-site backup of the `tokens` table every 6 hours, with automatic restore at startup when the pool is empty (free-tier containers do not guarantee disk persistence) | `3b813db` |
+
+### Multi-platform deployment notes
+
+- **Pterodactyl-based free hosts** (Wispbyte, HeavenCloud, and similar): the panel
+  injects `SERVER_PORT` while deeperseeker reads `PORT`, so use the start command
+  `PORT=$SERVER_PORT python app.py`.
+- The entire `wasm/` directory must be deployed — `deepseek_pow_solver.wasm` is
+  required for the PoW challenge and lives outside `requirements.txt`.
+- **`DB_PATH`** is honoured: point it at a persistent volume to keep the SQLite
+  token pool across container rebuilds.
+- The server reads `PORT` from the environment, so any platform that injects a
+  port works unchanged.
+
 ## Quickstart
 
 ### Local Python
@@ -79,9 +106,29 @@ cp .env.example .env
 
 ## Auth Token Setup
 
-1. Open incognito window -> `chat.deepseek.com` -> Login
-2. Console (F12): `JSON.parse(localStorage.getItem("userToken")).value`
-3. Paste raw token string into Dashboard (`/dashboard`). Close incognito window.
+1. Open a private/incognito window -> `chat.deepseek.com` -> Login
+2. Extract the token — **pick the method matching your device** (both are kept, either works):
+
+   **A. Desktop / Android (has devtools)**: Console (F12) ->
+   `JSON.parse(localStorage.getItem("userToken")).value`
+
+   **B. iPhone / iPad (Safari bookmarklet)**: iOS has no F12 console, and Safari refuses
+   to run `javascript:` typed into the address bar — so use a saved bookmark:
+
+   1. Safari: open any page -> Share -> **Add Bookmark** -> Save
+   2. Open the bookmarks list -> **Edit** that entry -> replace its address with the code
+      below (name it something recognisable, e.g. `DS token`) -> Save
+   3. On `chat.deepseek.com` (logged in, page fully loaded) -> tap the bookmarks icon ->
+      tap `DS token`. The token is copied to your clipboard and shown in an alert.
+
+   ```javascript
+   javascript:(function(){var t='';try{var r=localStorage.getItem('userToken');if(r){try{t=JSON.parse(r).value||r;}catch(e){t=r;}}}catch(e){alert('Read failed: '+e.message);return;}if(!t||t.length<20){alert('No userToken found. Make sure you are logged in to chat.deepseek.com and the page finished loading.');return;}var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();a.setSelectionRange(0,999999);var ok=document.execCommand('copy');a.remove();alert((ok?'Copied to clipboard\n\n':'Copy failed — long-press to copy manually\n\n')+'length '+t.length+'\n'+t.substring(0,12)+'...');})();
+   ```
+
+   > Android users can also use this bookmarklet (recent Chrome versions block pasting
+   > `javascript:` into the address bar), or keep using the F12 console above.
+
+3. Paste the raw token string into the Dashboard (`/dashboard`). Close the private window.
 
 ## API Endpoints & Usage
 
@@ -136,3 +183,17 @@ Educational purpose only. This project is not affiliated with, endorsed by, or s
 ## Contributors
 
 [![Contributors](https://contrib.rocks/image?repo=amancode22/deeperseeker)](https://github.com/amancode22/deeperseeker/graphs/contributors)
+
+## Additional Terms
+
+(These terms were part of the upstream LICENSE file and are reproduced here in
+full — nothing has been removed.)
+
+This software is not affiliated with, endorsed by, or sponsored by DeepSeek.
+Users must not use this software to violate any platform's terms of service, to
+resell or share access, or on accounts they do not own.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 AmanCode22 (upstream author).
+This fork's improvements are released under the same MIT license.

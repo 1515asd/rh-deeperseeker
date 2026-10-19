@@ -2065,4 +2065,7 @@ async def health(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "4000")))
+    # Pterodactyl-style panels (Wispbyte, HeavenCloud, ...) inject SERVER_PORT
+    # instead of PORT, so fall back to it before the built-in default.
+    _port = os.getenv("PORT") or os.getenv("SERVER_PORT") or "4000"
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(_port))
