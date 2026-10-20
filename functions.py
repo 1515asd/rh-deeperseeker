@@ -1205,6 +1205,35 @@ def _skip_bars(text, pos):
         pos += 1
     return pos
 
+def _is_plausible_bare_opener(line):
+    """True while `line` (no newline yet) could still become a bare opener
+    (decorated DSML tag missing its leading '<'). Prefix-tolerant: '|',
+    '| ', '| | D' all hold; '| a' (markdown table) does not."""
+    s = line.lstrip()
+    if not s or s.startswith("<"):
+        return False
+    m = re.match(r"^[｜\| \t]+", s)
+    if not m:
+        return False
+    rest = s[m.end():]
+    if not rest:
+        return True  # pure decoration so far
+    m2 = re.match(r"^D(?:S(?:M(?:L?)?)?)?", rest, re.IGNORECASE)
+    if not m2:
+        return False
+    rest2 = rest[m2.end():]
+    if not rest2:
+        return True
+    m3 = re.match(r"^[｜\| \t]+", rest2)
+    if not m3:
+        return False
+    rest3 = rest2[m3.end():]
+    if not rest3:
+        return True
+    low = rest3.lower()
+    return any(k.startswith(low) for k in ("tool_call", "calls", "function_call", "invoke", "parameter"))
+
+
 def _is_plausible_stream_entry_prefix(segment: str) -> bool:
     if not segment.startswith("<"):
         return False
@@ -1320,6 +1349,19 @@ class StreamToolParser:
                     self.in_tool = True
                     self.has_tool = True
                     continue
+                # [FIX 8] A bare opener line (missing leading '<', e.g.
+                # "| | DSML | | invoke ...") can only be repaired once its
+                # full line is in the buffer (_repair_bare_dsml_lines is
+                # line-anchored). While the LAST line is still streaming in
+                # (prefix could still become decoration+DSML+tag, no newline
+                # yet), hold it — but complete earlier lines are emitted.
+                last_nl = self.buffer.rfind("\n")
+                tail_line = self.buffer[last_nl + 1:]
+                if tail_line and _is_plausible_bare_opener(tail_line):
+                    if last_nl != -1:
+                        _append_clean_text(results, self.buffer[:last_nl + 1])
+                        self.buffer = tail_line
+                    break
                 # [FIX 2] Hold an unclosed '<' tail only while it remains a
                 # plausible partial match of _STREAM_ENTRY_RE or of a wrapper
                 # closer ("</..."), so a split closer is never dumped as prose.
@@ -1348,6 +1390,24 @@ class StreamToolParser:
     def flush(self):
         out = []
         if self.buffer and not self.in_tool:
+            # [FIX 8] Last chance: the stream ended before the bare-opener
+            # line got its newline — repair now (end-of-string closes the
+            # line for the line-anchored regex), then re-dispatch.
+            if "DSML" in self.buffer:
+                repaired = _repair_bare_dsml_lines(self.buffer)
+                m = _STREAM_ENTRY_RE.search(repaired)
+                if m:
+                    start = m.start()
+                    pre = repaired[:start]
+                    if pre.strip():
+                        _append_clean_text(out, pre)
+                    parsed, clean_tail = parse_tools(repaired[start:])
+                    for item in parsed:
+                        out.append({"tool": item})
+                    if clean_tail.strip():
+                        _append_clean_text(out, clean_tail)
+                    self.buffer = ""
+                    return out
             _append_clean_text(out, self.buffer)
         elif self.in_tool:
             # [FIX 1] Recover the tool before stripping: if the stream was cut
