@@ -6,6 +6,7 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import time
 import unicodedata
 import uuid
@@ -30,7 +31,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def _dump_stream_debug(session_id: str, text: str, kind: str = "stream"):
     """DEEPSEEKER_STREAM_DEBUG=1 时，把官网返回的原始聚合文本落盘，
     用于定位流式损坏发生在哪一环（官网输出 / 服务端处理 / 客户端显示）。
-    只保留最近 20 份，防止磁盘累积。"""
+    只保留最近 20 份，防止磁盘累积。
+    同时写入 db 表 debug_dumps —— 面板文件 API 的子目录读取通道不稳定，
+    根目录 db 下载是可靠的取证通道。"""
     if os.getenv("DEEPSEEKER_STREAM_DEBUG") != "1" or not text:
         return
     try:
@@ -45,6 +48,24 @@ def _dump_stream_debug(session_id: str, text: str, kind: str = "stream"):
                 os.remove(os.path.join(d, old))
             except OSError:
                 pass
+    except Exception:
+        pass
+    try:
+        conn = sqlite3.connect(os.path.join(BASE_DIR, "deeperseeker.db"), timeout=10)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS debug_dumps (ts INTEGER, name TEXT, content TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO debug_dumps (ts, name, content) VALUES (?, ?, ?)",
+                (int(time.time()), f"{int(time.time())}_{kind}_{str(session_id)[:8]}", text),
+            )
+            conn.execute(
+                "DELETE FROM debug_dumps WHERE ts NOT IN (SELECT ts FROM debug_dumps ORDER BY ts DESC LIMIT 20)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
 # B12 (Stage 1 audit): the global os.chdir(BASE_DIR) is gone — every relative
@@ -946,6 +967,15 @@ async def handle_chat(
             # 滑窗（~65 万）逐渐挤出；且历史里积累的畸形 DSML 输出会被模型
             # 模仿（恶性循环）。对策：每轮在最新消息末尾重申迷你铁律——它
             # 永远在滑窗之内，长对话中遵从度不衰减。成本 ~100 token/轮。
+            _recent_tail = json.dumps(messages[-6:], ensure_ascii=False, default=str)
+            if re.search(r"Tool call rejected|missing required parameter|参数为空|arguments (?:were |)empty|invalid tool call", _recent_tail, re.I):
+                # 客户端回传了工具拒绝/参数错误反馈：用户不必再手动提醒，
+                # 服务端检测到后自动加码。
+                prompt += (
+                    "\n\n[⚠️ 上一次工具调用已被系统拒绝]\n"
+                    "历史中检测到工具调用被拒绝的记录（参数为空或缺失）。"
+                    "这一次必须严格按下述规范执行，任何再次被拒绝的调用都会终止任务："
+                )
             prompt += (
                 "\n\n[工具调用规范 · 每轮重申]\n"
                 "1. 若需调用工具：输出且仅输出一个 <tool_call>{...}</tool_call> 块（arguments 为合法 JSON 对象）。\n"
