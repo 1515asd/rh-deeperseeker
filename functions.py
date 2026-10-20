@@ -905,7 +905,7 @@ def parse_tools(text):
         return any(s <= pos < e for s, e in fence_spans)
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
-    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
+    tool_matches = list(re.finditer(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
     real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
@@ -915,7 +915,7 @@ def parse_tools(text):
             end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
             body = text[start_idx:end_idx]
             args = {}
-            p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            p_matches = re.finditer(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
                 p_name = pm.group(1).strip()
                 p_val = pm.group(2).strip()
@@ -940,8 +940,8 @@ def parse_tools(text):
                     tools.append(norm)
 
     if tools:
-        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:tool_calls?|calls)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools and "DSML" in text:
         dsml_block_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)", re.DOTALL | re.IGNORECASE)
@@ -1094,7 +1094,7 @@ def parse_tools(text):
 # StreamToolParser so a mismatched closer closes the open block instead of
 # hanging until flush(). [FIX 3]
 _TOOL_END_TAG_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:tool_calls?|calls|invoke|function_calls?)\s*>",
+    r"</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls|invoke|function_calls?)\s*>",
     re.IGNORECASE,
 )
 
@@ -1104,14 +1104,14 @@ _TOOL_END_TAG_RE = re.compile(
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
 # Orphan closers trailing a block already closed by the per-tag or family
 # fallback (e.g. "</｜｜DSML｜｜ calls>" after the inner invoke was flushed).
 _ORPHAN_CLOSER_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:tool_calls?|calls|function_calls?|invoke)\s*[｜\|]{0,2}>",
+    r"</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls|function_calls?|invoke)\s*[｜\| \t]{0,8}>",
     re.IGNORECASE,
 )
 
@@ -1123,7 +1123,7 @@ _ORPHAN_CLOSER_RE = re.compile(
 # be EMPTY: "<｜｜DSML｜｜ invoke ...>" does not match and is left for the entry
 # regex.
 _BARE_DSML_MARKER_RE = re.compile(
-    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*>(?!\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)\b)",
+    r"</?[｜\| \t]{0,8}DSML[｜\| \t]{0,8}\s*>(?!\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)\b)",
     re.IGNORECASE,
 )
 
@@ -1132,7 +1132,7 @@ _BARE_DSML_MARKER_RE = re.compile(
 # the non-streaming path and on flush() to strip wrapper noise; unlike
 # _ORPHAN_CLOSER_RE it also removes stray OPEN tags.
 _WRAPPER_TAG_RE = re.compile(
-    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)[^>]*>",
+    r"</?[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)[^>]*>",
     re.IGNORECASE,
 )
 
@@ -1184,9 +1184,10 @@ def _append_clean_text(results, text: str) -> None:
 _STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_calls", "function_call", "invoke", "calls")
 
 def _skip_bars(text, pos):
-    for _ in range(2):
-        if pos < len(text) and text[pos] in "|｜":
-            pos += 1
+    # Skip any mix of bars/spaces/tabs (decorated dialects interleave them,
+    # e.g. "| | DSML | | >"); newlines are NOT decor — never cross lines.
+    while pos < len(text) and text[pos] in "|｜ \t":
+        pos += 1
     return pos
 
 def _is_plausible_stream_entry_prefix(segment: str) -> bool:
@@ -1298,7 +1299,7 @@ class StreamToolParser:
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
                     self._end_re = re.compile(
-                        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2}>?)?\s*" + re.escape(tag_name) + r"[｜\|]{0,2}\s*>",
+                        r"</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*" + re.escape(tag_name) + r"[｜\| \t]{0,8}\s*>",
                         re.IGNORECASE,
                     )
                     self.in_tool = True
