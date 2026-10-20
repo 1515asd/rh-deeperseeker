@@ -895,6 +895,23 @@ def _repair_bare_dsml_lines(text):
     return _BARE_OPEN_LINE_RE.sub(_fix, text)
 
 
+# Residue that ends up INSIDE a parameter value when the model emits a
+# stray decorated closer before the structural close (e.g.
+# ">检查...内容</| | DSML | |></｜DSML｜>parameter>"). Structural cleanup
+# never touches it because it is not at a tag boundary — strip it from
+# values directly. Bare decorated markers only; real prose is untouched.
+_VALUE_RESIDUE_RE = re.compile(
+    r"</?[｜\| \t]{0,8}DSML[｜\| \t]{0,8}\s*>",
+    re.IGNORECASE,
+)
+
+
+def _clean_param_value(val):
+    val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", val, flags=re.IGNORECASE)
+    val = _VALUE_RESIDUE_RE.sub("", val)
+    return val.strip()
+
+
 def parse_tools(text):
     text = _repair_bare_dsml_lines(text)
     tools = []
@@ -918,8 +935,7 @@ def parse_tools(text):
             p_matches = re.finditer(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
                 p_name = pm.group(1).strip()
-                p_val = pm.group(2).strip()
-                p_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", p_val, flags=re.IGNORECASE).strip()
+                p_val = _clean_param_value(pm.group(2))
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
@@ -928,8 +944,7 @@ def parse_tools(text):
             for pm in tag_param_matches:
                 t_name = pm.group(1).strip().lower()
                 if t_name in param_names:
-                    t_val = pm.group(2).strip()
-                    t_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", t_val, flags=re.IGNORECASE).strip()
+                    t_val = _clean_param_value(pm.group(2))
                     try:
                         args[t_name] = json.loads(t_val)
                     except Exception:
@@ -954,7 +969,7 @@ def parse_tools(text):
             args = {}
             for pm in param_pattern_b.finditer(body):
                 p_name = pm.group(1).lower().strip()
-                p_val = pm.group(2).strip()
+                p_val = _clean_param_value(pm.group(2))
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
