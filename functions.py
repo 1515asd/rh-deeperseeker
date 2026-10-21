@@ -901,7 +901,8 @@ def _repair_bare_dsml_lines(text):
 # never touches it because it is not at a tag boundary — strip it from
 # values directly. Bare decorated markers only; real prose is untouched.
 _VALUE_RESIDUE_RE = re.compile(
-    r"</?[｜\| \t]{0,8}DSML[｜\| \t]{0,8}\s*>",
+    r"</?[｜\| \t]{0,8}DSML[｜\| \t]{0,8}\s*>[^<\n]{0,12}>"  # marker + trailing fragment (e.g. ">参数>")
+    r"|</?[｜\| \t]{0,8}DSML[｜\| \t]{0,8}\s*>",
     re.IGNORECASE,
 )
 
@@ -1176,8 +1177,15 @@ def _sub_bare_markers(text: str) -> str:
         for k in ("tool_call", "calls", "function_call", "invoke", "parameter"):
             if low.startswith(k) or k.startswith(low):
                 return m.group(0)
+        # [v24] the marker itself is garbage; a short trailing fragment the
+        # model emitted on the same construct (e.g. "<｜｜DSML｜｜>参数>")
+        # is garbage too — drop it together with the marker.
         return ""
-    return _BARE_DSML_MARKER_RE.sub(_repl, text)
+    # [v24] marker+fragment PAIRS first (while the marker is still there to
+    # anchor the fragment), then any remaining bare markers.
+    _DECOR_FRAGMENT_RE = re.compile(r"</?[｜\| \t]{0,8}DSML[｜\| \t]{0,8}\s*>[^<\n]{0,12}>", re.IGNORECASE)
+    bare = _DECOR_FRAGMENT_RE.sub("", text)
+    return _BARE_DSML_MARKER_RE.sub(_repl, bare)
 
 
 def _strip_wrapper_tags(text: str) -> str:
