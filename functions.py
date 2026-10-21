@@ -1531,6 +1531,43 @@ async def solve_create_pow(target_path, auth_token):
     return base64.b64encode(json.dumps(json_data).encode()).decode()
 
 
+# ── PoW prefetch pool (v26) ─────────────────────────────────────────────
+# Every completion turn used to pay a full create_pow_challenge round-trip
+# (~200-400ms) plus wasm solve CPU before the real request could fire. The
+# challenge carries its own expire_at, so we pre-solve one in the background
+# right after each turn completes and the next turn consumes it instantly.
+# Request rate towards create_pow_challenge is unchanged (1 per turn), only
+# its timing moves earlier — zero semantic change for the upstream.
+_POW_PREFETCH: dict = {}
+_POW_PREFETCH_MAX = 8
+
+
+async def _prefetch_pow(auth_token, target_path="/api/v0/chat/completion"):
+    try:
+        p = await solve_create_pow(target_path, auth_token)
+        try:
+            data = json.loads(base64.b64decode(p))
+            expire_at = float(data.get("expire_at") or 0)
+        except Exception:
+            expire_at = 0
+        key = (auth_token, target_path)
+        if len(_POW_PREFETCH) >= _POW_PREFETCH_MAX:
+            _POW_PREFETCH.pop(next(iter(_POW_PREFETCH)), None)
+        _POW_PREFETCH[key] = (p, expire_at)
+    except Exception:
+        pass
+
+
+def _take_prefetched_pow(auth_token, target_path="/api/v0/chat/completion"):
+    entry = _POW_PREFETCH.pop((auth_token, target_path), None)
+    if not entry:
+        return None
+    p, expire_at = entry
+    if expire_at and expire_at < time.time() + 30:
+        return None  # too close to expiry — solve fresh
+    return p
+
+
 async def create_new_chat(auth_token):
     headers = get_headers(auth_token)
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
@@ -1651,7 +1688,13 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
         parent_message_id = None
     file_ids = file_ids_ or []
 
-    headers = get_headers(auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token))
+    _pow = _take_prefetched_pow(auth_token, "/api/v0/chat/completion")
+    if _pow is None:
+        _pow = await solve_create_pow("/api/v0/chat/completion", auth_token)
+    else:
+        # consumed one — refill in the background for the next turn
+        asyncio.create_task(_prefetch_pow(auth_token, "/api/v0/chat/completion"))
+    headers = get_headers(auth_token, _pow)
     json_data = {
         "chat_session_id": chat_id,
         "parent_message_id": parent_message_id,
@@ -1815,6 +1858,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
         try:
             async for chunk in _send_message_once(chat_id, auth_token, msg, parent, thinking, search, files):
                 yield chunk
+            asyncio.create_task(_prefetch_pow(auth_token, "/api/v0/chat/completion"))
             return  # 正常完成（上游发出 FINISHED）
         except _SseStreamFinished:
             return
