@@ -1814,7 +1814,22 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
             except _SseStreamFinished:
                 raise
 
-        async for chunk in resp.content.iter_any():
+        # [v29] Upstream stall guard: an SSE stream that neither emits bytes
+        # nor closes (thinking finished, answer pending, upstream hung) used
+        # to block until the CLIENT timed out first — the user saw "thinking
+        # done, no reply", and send_message's auto-continue never fired
+        # because the stream never *ended*. Treat N seconds of total silence
+        # as an interruption so the auto-continue path takes over.
+        _aiter = resp.content.iter_any()
+        _idle_timeout = float(os.getenv("DEEPSEEKER_STREAM_IDLE_TIMEOUT", "75"))
+        while True:
+            try:
+                chunk = await asyncio.wait_for(_aiter.__anext__(), timeout=_idle_timeout)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                logger.warning("[stream-stall] 上游流 %.0fs 无新字节（疑似挂起），主动中断以触发自动续写", _idle_timeout)
+                raise _SseStreamInterrupted()
             if not chunk:
                 continue
             line_buf += chunk
