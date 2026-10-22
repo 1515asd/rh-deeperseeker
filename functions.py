@@ -1174,6 +1174,11 @@ def _sub_bare_markers(text: str) -> str:
     def _repl(m):
         tail = text[m.end():m.end() + 24].lstrip()
         low = tail.lower()
+        if not low:
+            # Nothing follows the marker: no tool head can start here — drop
+            # it. (k.startswith("") is vacuously True and used to keep
+            # end-of-buffer bare markers alive, leaking them to clients.)
+            return ""
         for k in ("tool_call", "calls", "function_call", "invoke", "parameter"):
             if low.startswith(k) or k.startswith(low):
                 return m.group(0)
