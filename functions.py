@@ -910,6 +910,10 @@ _VALUE_RESIDUE_RE = re.compile(
 def _clean_param_value(val):
     val = re.sub(r"</?[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", val, flags=re.IGNORECASE)
     val = _VALUE_RESIDUE_RE.sub("", val)
+    # [v32] bare closer missing '</' stuck to the value tail (model writes
+    # "标题｜｜DSML｜｜>" instead of "</｜｜DSML｜｜ parameter>") — drop any
+    # trailing decoration tail that no legitimate value ends with.
+    val = re.sub(r"[｜\| \t]{0,8}DSML[｜\| \t]{0,8}(?:\s*(?:parameter|invoke|calls?|tool_calls?)\b[^>\n]{0,40}>)?\s*$", "", val, flags=re.IGNORECASE).strip()
     return val.strip()
 
 
@@ -933,7 +937,7 @@ def parse_tools(text):
             end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
             body = text[start_idx:end_idx]
             args = {}
-            p_matches = re.finditer(r"<[/]?[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:(?=<[/]?[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\b)|</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\b[^>]*>|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            p_matches = re.finditer(r"<[/]?[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:(?=<[/]?[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\b)|(?=[｜\| \t]{0,8}DSML[｜\| \t]{0,8}\s*>)|</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:parameter|tool_call|param|invoke)\b[^>]*>|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
                 p_name = pm.group(1).strip()
                 p_val = _clean_param_value(pm.group(2))
