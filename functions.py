@@ -1788,12 +1788,14 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
                             yield fragment.get("content", "")
                         else:
                             got_output = True
+                            _last_emit[0] = time.time()
                             yield fragment.get("content", "")
                 return
 
             v = data.get("v")
             if isinstance(v, str) and v:
                 got_output = True
+                _last_emit[0] = time.time()
                 yield v
 
         async def _consume_sse_line(decoded_line: str):
@@ -1821,14 +1823,23 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
         # because the stream never *ended*. Treat N seconds of total silence
         # as an interruption so the auto-continue path takes over.
         _aiter = resp.content.iter_any()
-        _idle_timeout = float(os.getenv("DEEPSEEKER_STREAM_IDLE_TIMEOUT", "75"))
+        _idle_timeout = float(os.getenv("DEEPSEEKER_STREAM_IDLE_TIMEOUT", "35"))
+        _last_emit = [time.time()]
         while True:
+            # [v30] Silence is measured on CONTENT EMISSION, not raw bytes:
+            # the upstream may dribble keep-alive bytes/blank lines forever
+            # while hanging, which would defeat a byte-level guard. remaining
+            # budget shrinks until _emit_from_event actually yields content.
+            remaining = _idle_timeout - (time.time() - _last_emit[0])
+            if remaining <= 0:
+                logger.warning("[stream-stall] 上游流 %.0fs 未产出任何内容（疑似挂起/心跳维持），主动中断以触发自动续写", _idle_timeout)
+                raise _SseStreamInterrupted()
             try:
-                chunk = await asyncio.wait_for(_aiter.__anext__(), timeout=_idle_timeout)
+                chunk = await asyncio.wait_for(_aiter.__anext__(), timeout=remaining)
             except StopAsyncIteration:
                 break
             except asyncio.TimeoutError:
-                logger.warning("[stream-stall] 上游流 %.0fs 无新字节（疑似挂起），主动中断以触发自动续写", _idle_timeout)
+                logger.warning("[stream-stall] 上游流 %.0fs 未产出任何内容（疑似挂起），主动中断以触发自动续写", _idle_timeout)
                 raise _SseStreamInterrupted()
             if not chunk:
                 continue
