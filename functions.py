@@ -1823,7 +1823,7 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
         # because the stream never *ended*. Treat N seconds of total silence
         # as an interruption so the auto-continue path takes over.
         _aiter = resp.content.iter_any()
-        _idle_timeout = float(os.getenv("DEEPSEEKER_STREAM_IDLE_TIMEOUT", "35"))
+        _idle_timeout = float(os.getenv("DEEPSEEKER_STREAM_IDLE_TIMEOUT", "25"))
         _last_emit = [time.time()]
         while True:
             # [v30] Silence is measured on CONTENT EMISSION, not raw bytes:
