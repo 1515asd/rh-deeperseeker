@@ -67,47 +67,83 @@ import hashlib as _hashlib
 import json as _json
 from collections import OrderedDict as _OrderedDict
 
+_CHAIN_WINDOW = 9  # estimate 回看 8 条 + 全量 1 条
 _EST_CACHE: " _OrderedDict[str, int]" = _OrderedDict()
 _EST_CACHE_MAX = 4096
 
 
 def _msgs_key(messages) -> str:
-    h = _hashlib.sha256()
+    """[v46] 单遍哈希：先拼成一个 byte 串再哈希一次。
+
+    旧版对每条消息调用两次 h.update，1500 条消息 = 3000 次 Python 级调用，
+    在 iSH/aarch64 上比整块 sha256 慢 40%（实测 174ms vs 121ms）。
+    分隔符用 \x00 保留边界信息，语义与原版一致。
+    """
+    parts = []
     for m in messages:
+        parts.append(b"\x00")
+        parts.append(m.get("role", "").encode("utf-8", "ignore"))
+        c = m.get("content", "")
+        blob = c if isinstance(c, str) else _json.dumps(c, ensure_ascii=False)
+        parts.append(blob.encode("utf-8", "ignore"))
+    return _hashlib.sha256(b"".join(parts)).hexdigest()
+
+
+def _msgs_chain(messages):
+    """[v47] 链式前缀哈希：一次 O(n) 得到全部前缀的 key。
+
+    H_i = sha256(H_{i-1} || 0x00 || role || content)，返回 [H_1 .. H_n]。
+    旧实现为了找最长命中前缀，对 messages[:n]、messages[:n-1] ... 各算一次
+    全量 _msgs_key；1500 条历史上全 miss 要跑 9 遍、实测 1660ms。链式做法
+    每条消息只做一次小输入 sha256（一次预处理即可得所有前缀键），实测 ~5ms。
+    """
+    h = _hashlib.sha256()
+    out = []
+    n = len(messages)
+    # 只有最后 _CHAIN_WINDOW 个前缀键会被 estimate 用到（它最多回看 8 条），
+    # 前面的消息只喂进哈希、不留快照——1500 条历史上省掉 1491 次
+    # copy+hexdigest（iSH 上每次 ~0.1ms，合计 ~180ms）。
+    first_snap = max(0, n - _CHAIN_WINDOW)
+    for i, m in enumerate(messages):
         h.update(b"\x00")
         h.update(m.get("role", "").encode("utf-8", "ignore"))
         c = m.get("content", "")
         blob = c if isinstance(c, str) else _json.dumps(c, ensure_ascii=False)
         h.update(blob.encode("utf-8", "ignore"))
-    return h.hexdigest()
+        if i >= first_snap:
+            out.append(h.copy().hexdigest())
+    return out
 
 
 def estimate_conversation_tokens_cached(messages):
     """estimate_conversation_tokens with a longest-cached-prefix fast path.
 
-    Hashing the full history is ~10ms (hashlib) versus seconds for the
-    tokenizer, so the key itself is recomputed every time — correctness
-    never depends on trusting the client. On a hit only the tail messages
-    (usually a few hundred tokens) are tokenized; misses fall back to the
-    full estimate and prime the cache for the next turn."""
+    [v47] 前缀键改用链式哈希一次算出（见 _msgs_chain），不再对每个候选
+    前缀重算全量哈希。命中后只 tokenize 新增的尾部消息。
+    """
     n = len(messages)
+    if n == 0:
+        return 0
+    chain = _msgs_chain(messages)
+    full_key = chain[-1]
     for back in range(0, min(8, n) + 1):
-        prefix = messages[: n - back] if back else messages
-        key = _msgs_key(prefix)
+        if back >= len(chain):
+            break
+        key = chain[len(chain) - back - 1]
         cached = _EST_CACHE.get(key)
         if cached is None:
             continue
         est = cached
         if back:
             est += estimate_conversation_tokens(messages[n - back :])
-        _EST_CACHE[key if not back else _msgs_key(messages)] = est
-        _EST_CACHE.move_to_end(_msgs_key(messages))
+        _EST_CACHE[full_key] = est
+        _EST_CACHE.move_to_end(full_key)
         while len(_EST_CACHE) > _EST_CACHE_MAX:
             _EST_CACHE.popitem(last=False)
         return est
     est = estimate_conversation_tokens(messages)
-    _EST_CACHE[_msgs_key(messages)] = est
-    _EST_CACHE.move_to_end(_msgs_key(messages))
+    _EST_CACHE[full_key] = est
+    _EST_CACHE.move_to_end(full_key)
     while len(_EST_CACHE) > _EST_CACHE_MAX:
         _EST_CACHE.popitem(last=False)
     return est
@@ -353,6 +389,88 @@ async def extract_tools(tools):
     return body
 
 
+def _render_tool_calls_block(tool_calls):
+    """把 assistant 的 tool_calls 渲染成模型熟悉的 <tool_call>{...}</tool_call> 格式。
+
+    [v65] 串线根治专用。格式与 canonicalize_messages 内部渲染一致（sort_keys），
+    但这里是独立函数：canonicalize 的输出参与会话签名计算，一个字节都不能动。
+    """
+    parts = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name") or tc.get("name")
+        args = fn.get("arguments") or tc.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        parts.append("<tool_call>" + json.dumps({"arguments": args, "name": name}, sort_keys=True) + "</tool_call>")
+    return "\n".join(parts)
+
+
+def _index_tool_calls(messages):
+    """建 call_id -> (name, arguments) 索引。
+
+    [v65] 串线根治：tool 消息只带结果、不带命令；命令在 assistant 消息的
+    tool_calls 字段（OpenAI 格式）或 content 的 tool_use 块（Anthropic 格式）里。
+    没有这个索引，模型看到的结果就是"来源不明"的——它只能猜哪个结果对应哪条
+    命令，猜错就是用户看到的"串线"。
+    """
+    index = {}
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            cid = tc.get("id")
+            fn = tc.get("function") or {}
+            name = fn.get("name") or tc.get("name")
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass
+            if cid and name:
+                index[cid] = (name, args)
+        content = m.get("content")
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("id") and c.get("name"):
+                    index[c["id"]] = (c["name"], c.get("input", {}))
+    return index
+
+
+def _render_msg_content(msg, is_assistant=False):
+    """渲染一条消息的可见内容。
+
+    [v65] 串线根治：assistant 的命令在 tool_calls 字段里，不在 content 里。
+    旧代码只渲染 content 文本 → 纯工具调用的 assistant 消息整条从历史里消失，
+    模型随后在 [TOOL RESULTS] 里看到一堆没有命令的结果，只能猜对应关系。
+    """
+    content = msg.get("content", "")
+    parts = []
+    if isinstance(content, list):
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text" and c.get("text"):
+                parts.append(c["text"])
+            elif is_assistant and c.get("type") == "tool_use" and c.get("name"):
+                parts.append("<tool_call>" + json.dumps({"arguments": c.get("input", {}), "name": c["name"]}, sort_keys=True) + "</tool_call>")
+    elif content:
+        parts.append(str(content))
+    if is_assistant:
+        tc_block = _render_tool_calls_block(msg.get("tool_calls"))
+        if tc_block:
+            parts.append(tc_block)
+    return "\n".join(parts)
+
+
 async def extract_tool_results(messages, latest_only=False):
     target_messages = messages
     if latest_only:
@@ -363,6 +481,9 @@ async def extract_tool_results(messages, latest_only=False):
                 break
         if last_ast_idx != -1:
             target_messages = messages[last_ast_idx + 1:]
+    # [v65] 索引建在全量 messages 上：latest_only 窗口之外的 assistant 也可能
+    # 携带窗口内结果的命令。建全量零成本，且防漏。
+    call_index = _index_tool_calls(messages)
     tools_final = []
     for i in target_messages:
         if i.get("role") == "tool":
@@ -372,8 +493,33 @@ async def extract_tool_results(messages, latest_only=False):
             if isinstance(content, list):
                 content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
             content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
-            tools_final.append(f"Tool: {name} (Call ID: {call_id})\nResult: {content}")
-    return "\n\n".join(tools_final) if tools_final else None
+            block = f"Tool: {name} (Call ID: {call_id})"
+            hit = call_index.get(call_id)
+            title = ""
+            if hit:
+                cmd_name, cmd_args = hit
+                # [v70] 回显模型自己起的调用标题（tool_title）：自己起的名字
+                # 是最强的认领锚点——比 JSON 更不容易认错自己的调用。
+                if isinstance(cmd_args, dict):
+                    t = str(cmd_args.get("tool_title") or "").strip()
+                    if t:
+                        title = t[:40]
+                cmd_json = json.dumps({"arguments": cmd_args, "name": cmd_name}, sort_keys=True)
+                block += f"\nCommand: <tool_call>{cmd_json}</tool_call>"
+            if title:
+                block += f"\nTitle: 你将这次调用命名为「{title}」"
+            block += f"\nResult: {content}"
+            tools_final.append(block)
+    if not tools_final:
+        return None
+    # [v69] 对账单：官方 API 里结果↔调用靠 tool_call_id 结构化绑定（查表）；
+    # 我们的文本通道里只能靠模型阅读配对。给每条结果编号并声明总数，把
+    # "阅读理解"降级为"数数"——生产取证（2026-10-25 会话 a83aad65）中模型
+    # 连发两个调用后把自己的调用记混、误报"串线"，此为最小成本的压制手段。
+    n = len(tools_final)
+    count_line = f"[共 {n} 条结果，按发出顺序对应最近的 {n} 次调用，一一对应]"
+    numbered = [f"[结果 {i + 1}/{n}]\n{b}" for i, b in enumerate(tools_final)]
+    return count_line + "\n" + "\n\n".join(numbered)
 
 
 def _assert_public_url(url):
@@ -633,9 +779,13 @@ _SIG_CACHE: "_OrderedDict[str, str]" = _OrderedDict()
 _SIG_CACHE_MAX = 4096
 
 
-def _sig_cache_put(messages, model, scope, sig):
-    _SIG_CACHE[_msgs_key(messages) + f"|{model}|{scope}"] = sig
-    _SIG_CACHE.move_to_end(_msgs_key(messages) + f"|{model}|{scope}")
+def _sig_cache_put(messages, model, scope, sig, key=None):
+    # [v46] key 可由调用方传入：旧版在这里对同一份历史算两次 _msgs_key，
+    # 一次缓存未命中就要付 3 遍全量哈希（本函数 2 遍 + 调用方 1 遍）。
+    if key is None:
+        key = _msgs_key(messages) + f"|{model}|{scope}"
+    _SIG_CACHE[key] = sig
+    _SIG_CACHE.move_to_end(key)
     while len(_SIG_CACHE) > _SIG_CACHE_MAX:
         _SIG_CACHE.popitem(last=False)
 
@@ -653,7 +803,8 @@ def generate_signature_cached(messages, model, scope=""):
         _SIG_CACHE.move_to_end(key)
         return cached
     sig = generate_signature_sync(messages, model, scope)
-    _sig_cache_put(trunc, model, scope, sig)
+    # trunc 与 key 的对应关系上面已经算过，直接复用，不再重算哈希
+    _sig_cache_put(trunc, model, scope, sig, key=key)
     return sig
 
 
@@ -676,7 +827,7 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         relevant_tool_results = await extract_tool_results(messages, latest_only=True)
         if relevant_tool_results:
             relevant_tool_results = _capped_text(relevant_tool_results, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
-            final_prompt += f"[TOOL RESULTS]\n{relevant_tool_results}\n\n"
+            final_prompt += f"[TOOL RESULTS]（以下是你最近一次工具调用的返回结果，每条 Result 上方的 Command 就是引发它的调用原文，结果与命令一一对应）\n{relevant_tool_results}\n\n"
         user_msg = await extract_user_msg(messages)
         if user_msg:
             final_prompt += f"[USER]\n{user_msg}\n\n"
@@ -690,9 +841,10 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
                 role = msg.get("role", "unknown")
                 if role in ("system", "tool"):
                     continue
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+                # [v65] 串线根治：assistant 的命令在 tool_calls 字段里，必须渲染进
+                # 历史；否则纯工具调用的 assistant 消息整条消失，[TOOL RESULTS] 里
+                # 的结果全部变成"来源不明"，模型只能猜对应关系——猜错即串线。
+                content = _render_msg_content(msg, is_assistant=(role == "assistant"))
                 if content:
                     history_parts.append(f"{role.upper()}: {content}")
             if history_parts:
@@ -704,7 +856,8 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         tools_result_extract = await extract_tool_results(messages, latest_only=False)
         if tools_result_extract:
             tools_result_extract = _capped_text(tools_result_extract, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
-            final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
+            # [v68] 首条路径打包的是全部历史结果，用"历史"措辞
+            final_prompt += f"[TOOL RESULTS]（以下是本轮对话中的历史工具调用结果，每条 Result 上方的 Command 就是引发它的调用原文，结果与命令一一对应）\n{tools_result_extract}\n\n"
 
         user_msg = await extract_user_msg(messages)
         if user_msg:
@@ -720,7 +873,10 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         tools_result_extract = await extract_tool_results(messages, latest_only=True)
         if tools_result_extract:
             tools_result_extract = _capped_text(tools_result_extract, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
-            final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
+            # [v68] 自描述头：生产取证（2026-10-25 会话 a83aad65）证明结果与命令
+            # 一一对应，但模型把自己的两次调用记混后归因"通道串线"。加一句锚点
+            # 说明，降低误报率。
+            final_prompt += f"[TOOL RESULTS]（以下是你最近一次工具调用的返回结果，每条 Result 上方的 Command 与 Title 就是引发它的调用原文，结果与命令一一对应，不存在串线。若某条结果与预期不符，先核对该条的 Title 与 Command——那确认是你自己发起的调用——再调整调用参数本身）\n{tools_result_extract}\n\n"
 
         trailing_user_parts = []
         for m in trailing_messages:

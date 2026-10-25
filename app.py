@@ -28,6 +28,31 @@ from fastapi.templating import Jinja2Templates
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def _dump_prompt_debug(session_id: str, text: str):
+    """DEEPSEEKER_STREAM_DEBUG=1 时，把每轮实际发给模型的 prompt 落盘。
+
+    定位"结果错位/串线"：模型对"哪个结果对应哪条调用"的判断完全取决于
+    这份打包文本（[TOOL RESULTS] 的 Command 配对）。有它就能对照模型
+    自报的"收到旧结果"判断是真错位还是模型误读。独立目录独立 20 份环，
+    不与输出 dump（debug_streams）互相挤占。"""
+    if os.getenv("DEEPSEEKER_STREAM_DEBUG") != "1" or not text:
+        return
+    try:
+        d = os.path.join(BASE_DIR, "debug_prompts")
+        os.makedirs(d, exist_ok=True)
+        fn = os.path.join(d, f"{int(time.time())}_prompt_{str(session_id)[:8]}.txt")
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(text)
+        files = sorted(f for f in os.listdir(d) if f.endswith(".txt"))
+        for old in files[:-20]:
+            try:
+                os.remove(os.path.join(d, old))
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _dump_stream_debug(session_id: str, text: str, kind: str = "stream"):
     """DEEPSEEKER_STREAM_DEBUG=1 时，把官网返回的原始聚合文本落盘，
     用于定位流式损坏发生在哪一环（官网输出 / 服务端处理 / 客户端显示）。
@@ -98,6 +123,7 @@ from functions import (
     next_parent,
     parse_tools,
     pick_token,
+    warmup_pool,
     acquire_token_slot,
     record_file,
     get_file_token,
@@ -108,6 +134,7 @@ from functions import (
     StreamToolParser,
     upload_file,
     get_file_content,
+    _RetryBoundary,
 )
 
 
@@ -302,6 +329,11 @@ async def _db(fn, *args, **kwargs):
 async def lifespan(app: FastAPI):
     await _db(init_db)
     _install_key_access_formatter()
+    # [v57 移植 v35] 预热：wasm 编译 + 上游 TLS + PoW 池。30s 封顶，失败不影响启动。
+    try:
+        await asyncio.wait_for(warmup_pool(), timeout=30)
+    except Exception as exc:
+        print(f"[warmup] skipped: {exc}", flush=True)
     # ds_backup: token-pool disaster recovery — auto-restore missing tokens at
     # startup, periodic encrypted off-site backup while running. Silently
     # no-ops unless DEEPSEEKER_BACKUP_SECRET is configured.
@@ -980,17 +1012,15 @@ async def handle_chat(
                 )
             prompt += (
                 "\n\n[工具调用规范 · 每轮重申]\n"
-                "1. 若需调用工具：输出且仅输出一个 <tool_call>{...}</tool_call> 块（arguments 为合法 JSON 对象）。\n"
-                "2. 所有必填参数必须填入具体的、非空的值——参数为空或缺失的调用会被直接拒绝，任务失败。\n"
-                "3. 正确示例：<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"具体搜索词\"}}</tool_call>\n"
-                "   禁止示例：<tool_call>{\"name\": \"web_search\", \"arguments\": {}}</tool_call>（参数空，会被拒绝）\n"
-                "4. 忽略历史输出中出现过的任何畸形/残缺的工具调用样例，一律以本规范为准。\n"
-                "5. 各工具的参数定义见本对话开头的工具说明；记不清必填项就先向用户确认。\n"
-                "6. 若无需调用工具，直接回答正文，不要输出任何工具标签。\n"
-                "7. 【收尾纪律】工具调用块闭合后必须立即停止输出——禁止在闭合之后继续输出任何标记、残片、文字或符号（如 \"参数>\"、\"calls>\"、\"???参数>\" 之类的收尾垃圾一律禁止）。\n"
-                "8. 参数值内部不允许出现任何标签残片或转义碎片；值写完就直接闭合。"
+                "1. 需要工具时：输出一个工具调用块，块内为合法 JSON，含 name 与 arguments 两个键。\n"
+                "2. arguments 的每个必填字段都要有具体值；空对象或字段缺失的调用会被系统直接拒绝。\n"
+                "3. 参数值写完立即闭合，闭合后不得再追加任何字符。\n"
+                "4. 不需要工具时直接给正文，不输出任何标签。\n"
+                "5. 历史中出现过的畸形调用样例一律忽略，只以本规范为准。\n"
+                "6. 各工具的参数定义见对话开头的工具说明；记不清必填项就先向用户确认。"
             )
 
+        _dump_prompt_debug(session_id, prompt)
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
         if stream and tools and not is_anthropic and os.getenv("DEEPSEEKER_STREAM_SPLITTER", "1") != "1":
@@ -1125,6 +1155,77 @@ async def handle_chat(
                 slot.release()
 
 
+# --- usage 计费 token 的增量缓存 (v57 移植 v37 + 修正) ---------------------
+# count_tok(_messages_text(messages)) 每轮都把整段历史重新 tokenize 一遍，
+# 算出来的数字只塞进 usage 字段。上下文越大越慢：25% CPU 配额下 80 万
+# token 要 2-5 秒，而 Anthropic 路径把这个计算放在首字节之前，直接压在
+# TTFB 上。正常对话每轮重发的都是同一份前缀，因此按消息前缀缓存，命中
+# 最长前缀后只 tokenize 新增的尾部几条。
+#
+# [v57 修正1 复合漂移] v37 原版把"派生估计值"也存进缓存当基值，误差逐轮
+# 复合——实测 50 轮对话漂移累积到 15 token（每轮 +1：拼接处的 "\n" 在
+# 全量文本里与相邻字符合并，分开计则各算各的）。本版规则：入缓存的只能
+# 是"直接重算"的值，派生估计（基值 + 裸计尾条）绝不入缓存——它只回答
+# 本轮，不当基值。误差因此退化为单点拼接效应，<=1 token 且不复合
+# （50 轮随机对话实测最大 1）。
+#
+# [v57 修正2 双口径] v37 的 miss 路径返回并缓存 文本+"\n" 的计数，而
+# 上游 test_stream_usage 断言 usage.prompt_tokens 等于裸文本直算值——
+# 尾部 "\n" 多算一个 token 就会差 1。因此缓存条目改存两个直接重算值：
+#   direct = count_tok(文本)          精确命中时的返回值，与 v33 直算口径
+#                                    一致（也是上游断言要求的口径）；
+#   base   = count_tok(文本 + "\n")   仅作尾条拼接的基值：尾部分隔符算进
+#                                    基值，下一轮的拼接点才与全量文本一致。
+# 精确命中返回 direct；带尾条命中返回 base + 裸计尾条。派生值一律不入
+# 缓存，直接重算从"仅首轮"变成"约每 9 轮一次"（8 深度窗口内没有直接值
+# 时可命中；仍在首字节前，比每轮全量重算快 9 倍）。
+_USAGE_TOK_CACHE = None
+_USAGE_TOK_CACHE_MAX = 2048
+
+
+def _usage_prefix_key(messages):
+    import hashlib
+    h = hashlib.sha256()
+    for m in messages:
+        h.update(b"\x00")
+        h.update(str(m.get("role", "")).encode("utf-8", "ignore"))
+        c = m.get("content", "")
+        blob = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False, default=str)
+        h.update(blob.encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
+def _count_messages_tokens(messages):
+    global _USAGE_TOK_CACHE
+    if _USAGE_TOK_CACHE is None:
+        from collections import OrderedDict
+        _USAGE_TOK_CACHE = OrderedDict()
+    cache = _USAGE_TOK_CACHE
+    if not messages:
+        return 0
+    n = len(messages)
+    for back in range(0, min(8, n) + 1):
+        prefix = messages[: n - back] if back else messages
+        key = _usage_prefix_key(prefix)
+        cached = cache.get(key)
+        if cached is None:
+            continue
+        if back:
+            # 基值含尾部分隔符 "\n"，尾条裸计；派生值绝不入缓存
+            return cached[1] + count_tok(_messages_text(messages[n - back:]))
+        return cached[0]
+    # 窗口内没有直接值：两个口径都直接重算，一起入缓存。
+    # 只存直接值——派生值不当基值，误差因此不会逐轮复合。
+    direct = count_tok(_messages_text(messages))
+    base = count_tok(_messages_text(messages) + "\n")
+    full_key = _usage_prefix_key(messages)
+    cache[full_key] = (direct, base)
+    cache.move_to_end(full_key)
+    while len(cache) > _USAGE_TOK_CACHE_MAX:
+        cache.popitem(last=False)
+    return direct
+
+
 async def collect_response(gen):
     text = ""
     async for chunk in gen:
@@ -1246,7 +1347,14 @@ class _StreamTagSplitter:
                     out.append(("content", safe))
                 return out
             if i:
-                out.append(("content", self.buf[:i]))
+                # [v59] 开标签前的纯空白是 _send_message_once "\n<think>"  yield 的
+                # 前导分隔符，不属于正文：放行会让每个流式轮次的 content 都被
+                # 漏进一个孤换行（工具轮正文恰好只有它，2026-10-24 用户报告）。
+                # Anthropic 路径早就 lstrip("\n") 剥掉它，此处对齐同一语义；
+                # 有实际文字的前导内容（模型真的先写正文再思考）仍原样放行。
+                pre = self.buf[:i]
+                if pre.strip():
+                    out.append(("content", pre))
             self.buf = self.buf[i + len(self.OPEN):]
             self.in_think = True
             continue
@@ -1298,6 +1406,15 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     try:
         splitter = _StreamTagSplitter()
         async for chunk in gen:
+            # [v61] 续写轮边界哨兵：空串 str 子类，必须先于下面的 falsy 检查
+            # 拦截。重置 splitter——其 think_done 闭锁（见 _StreamTagSplitter
+            # / functions._RetryBoundary 文档）会让续写轮开头的 "\n<think>"
+            # 不再被识别，整段思考漏进 content。重置后续写轮的思考正确分流
+            # 到 reasoning。丢弃的是 attempt 尾部 ≤6 字符的 held 标签前缀，
+            # 续写轮以 "\n" 开头不依赖跨 attempt 的标签完整性。
+            if isinstance(chunk, _RetryBoundary):
+                splitter = _StreamTagSplitter()
+                continue
             if not chunk:
                 continue
             full_text += chunk
@@ -1388,7 +1505,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 # the empty choices array is what gateways expect, and official
                 # SDKs simply ignore it. Skipped on aborted/failed streams so a
                 # partial response never pollutes billing.
-                in_tokens = count_tok(_messages_text(messages))
+                in_tokens = _count_messages_tokens(messages)
                 # B7: usage on the cleaned completion, not raw full_text —
                 # think-tag reasoning and tool markup are not billed output.
                 usage_out = _completion_usage_text(clean_text, parsed_tools)
@@ -1403,7 +1520,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 
 async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope=""):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-    in_tokens = count_tok(_messages_text(messages))
+    in_tokens = _count_messages_tokens(messages)
     model_name = req_model if req_model else model
     start_evt = f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': in_tokens, 'output_tokens': 1}}})}\n\n"
     yield start_evt
@@ -1584,7 +1701,7 @@ def format_response(text, model, messages, tools=None):
     clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
-    in_tokens = count_tok(_messages_text(messages))
+    in_tokens = _count_messages_tokens(messages)
     # B7: bill the CLEANED completion (see _completion_usage_text), not the
     # raw upstream text whose thinking + markup share the client never asked
     # to pay for.
