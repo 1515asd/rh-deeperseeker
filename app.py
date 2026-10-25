@@ -940,9 +940,17 @@ async def handle_chat(
                 parent_message_id = fresh["parent_message_id"]
 
         _rollover_baseline = await _db(get_chat_baseline, session_id)
-        if parent_message_id != 0 and needs_rollover(messages, _rollover_baseline):
+        # [v72] 定期重建：除了上下文超限，会话轮数超过阈值也触发同一套
+        # rollover 流程（删映射→生成摘要→新上游会话→按客户端真实历史全量
+        # 重打包，重建后首条路径自动带任务锚点+对账单）。动机：长会话中
+        # 上游历史积累畸形输出与旧叙事偏置（生产实证 2026-10-25 会话
+        # ae65e2aa：数小时旧叙事淹没 30 秒前的金手指指令），且滑窗会无声
+        # 丢失中段信息；定期重建等于定期把模型的世界观对齐到客户端账本。
+        _rebuild_due = parent_message_id >= int(os.getenv("DEEPSEEKER_REBUILD_PARENT", "240"))
+        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline) or _rebuild_due):
             logger.info(
-                "Context rollover: accumulated context over limit; purging session mappings for chat %s",
+                "Context rollover: accumulated context over limit%s; purging session mappings for chat %s",
+                " (periodic rebuild: parent=%d)" % parent_message_id if _rebuild_due else "",
                 session_id,
             )
             await _db(delete_sessions_for_chat, token_id, session_id)
