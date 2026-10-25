@@ -870,13 +870,25 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
                 break
 
         trailing_messages = messages[last_ast_idx + 1:] if last_ast_idx != -1 else [messages[-1]]
+        # [v71] 纯工具结果轮的任务锚点。生产取证（2026-10-25 会话 ae65e2aa）：
+        # 用户要求加金手指、模型干到一半，随后的纯工具结果轮里没有任何用户
+        # 文本，模型只能去上游会话历史里"考古"判断当前任务——数小时的旧叙事
+        # （基准结论）淹没了 30 秒前的指令，它挖出旧消息当作"用户最后的话"，
+        # 判定"金手指是我自作主张"并删掉，反复回到旧结论。官方 API 无此病：
+        # 用户指令永远结构化地留在每轮重放的消息列表里。对策：纯工具轮把
+        # 用户最新的真实指令作为 [CURRENT TASK] 锚点放进 prompt 最前面。
+        task_anchor = ""
+        if not any(m.get("role") == "user" for m in trailing_messages):
+            user_msg = await extract_user_msg(messages)
+            if user_msg:
+                task_anchor = "[CURRENT TASK]（你正在执行的用户最新指令；下方工具结果都是为它服务的，与历史结论无关）\n" + _trim_to_budget(user_msg.strip(), 600) + "\n\n"
         tools_result_extract = await extract_tool_results(messages, latest_only=True)
         if tools_result_extract:
             tools_result_extract = _capped_text(tools_result_extract, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
             # [v68] 自描述头：生产取证（2026-10-25 会话 a83aad65）证明结果与命令
             # 一一对应，但模型把自己的两次调用记混后归因"通道串线"。加一句锚点
             # 说明，降低误报率。
-            final_prompt += f"[TOOL RESULTS]（以下是你最近一次工具调用的返回结果，每条 Result 上方的 Command 与 Title 就是引发它的调用原文，结果与命令一一对应，不存在串线。若某条结果与预期不符，先核对该条的 Title 与 Command——那确认是你自己发起的调用——再调整调用参数本身）\n{tools_result_extract}\n\n"
+            final_prompt += task_anchor + f"[TOOL RESULTS]（以下是你最近一次工具调用的返回结果，每条 Result 上方的 Command 与 Title 就是引发它的调用原文，结果与命令一一对应，不存在串线。若某条结果与预期不符，先核对该条的 Title 与 Command——那确认是你自己发起的调用——再调整调用参数本身）\n{tools_result_extract}\n\n"
 
         trailing_user_parts = []
         for m in trailing_messages:
