@@ -28,6 +28,59 @@ from fastapi.templating import Jinja2Templates
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+# ── [v74] 重试保险丝（真幂等）─────────────────────────────────────────
+# 官方 API 无状态 → 客户端重试绝对安全；我们有状态会话，完成后重试会让
+# 上游重复执行。此缓存记录"刚完成"的请求结果：窗口内同签名请求直接回放，
+# 不重复执行。仅记录成功完成的回合（失败/中断不记，重试照常放行）。
+# 权限取舍：窗口默认 120 秒——网络重试都在秒级；人类点"重新生成"通常会
+# 先删掉上一条回复（消息列表变化 → 签名不同 → 不受影响）。
+_DUP_CACHE = {}
+_DUP_CACHE_MAX = 256
+
+
+def _dup_record(sig, body):
+    _DUP_CACHE[sig] = {"ts": time.time(), "body": body}
+    while len(_DUP_CACHE) > _DUP_CACHE_MAX:
+        _DUP_CACHE.pop(next(iter(_DUP_CACHE)))
+
+
+def _dup_lookup(sig):
+    ent = _DUP_CACHE.get(sig)
+    if not ent:
+        return None
+    if time.time() - ent["ts"] > int(os.getenv("DEEPSEEKER_DUP_WINDOW", "120")):
+        _DUP_CACHE.pop(sig, None)
+        return None
+    return ent["body"]
+
+
+def _json_mode_coerce(resp_text):
+    """[v73] JSON 模式出口校验：从原始输出提取合法 JSON 值。
+
+    返回 (text, ok)。三层尝试：原文直解 → 剥 markdown 围栏 → 首尾括号截取。
+    全部失败时原样返回（不阻塞交付）。"""
+    body = re.sub(r"<think>.*?</think>", "", resp_text, flags=re.DOTALL).strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", body, flags=re.DOTALL)
+    if fence:
+        body = fence.group(1).strip()
+    try:
+        json.loads(body)
+        return body, True
+    except Exception:
+        pass
+    for open_c, close_c in (("{", "}"), ("[", "]")):
+        i = body.find(open_c)
+        j = body.rfind(close_c)
+        if i != -1 and j > i:
+            cand = body[i:j + 1]
+            try:
+                json.loads(cand)
+                return cand, True
+            except Exception:
+                continue
+    return resp_text, False
+
+
 def _dump_prompt_debug(session_id: str, text: str):
     """DEEPSEEKER_STREAM_DEBUG=1 时，把每轮实际发给模型的 prompt 落盘。
 
@@ -718,6 +771,7 @@ async def handle_chat(
     _attempt=0,
     _auth_rotated=False,
     _exclude_token=None,
+    json_mode=False,
 ):
     auth_token = await _db(get_auth_token)
     if not auth_token:
@@ -984,6 +1038,26 @@ async def handle_chat(
         slot = acquire_token_slot(token_id)
 
         is_first = parent_message_id == 0
+
+        # [v74] 重试保险丝：窗口内同签名（完全相同的消息列表）已完成 → 直接
+        # 回放缓存结果，不重复执行。官方 API 因无状态而天然幂等；此为有状态
+        # 通道的对位机制。仅拦非 Anthropic 路径；窗口 120 秒可调
+        # （DEEPSEEKER_DUP_WINDOW）。人类"重新生成"通常先删上一条回复，
+        # 消息列表变化 → 签名不同 → 不受影响。
+        if not is_anthropic:
+            cached_body = _dup_lookup(sig)
+            if cached_body is not None:
+                logger.warning(
+                    "[dup-guard] sig=%s 窗口内已完成，回放缓存结果（不重复执行）",
+                    str(sig)[:12],
+                )
+                if stream:
+                    return StreamingResponse(
+                        _pseudo_stream(cached_body, req_model or model),
+                        media_type="text/event-stream",
+                    )
+                return cached_body
+
         # Stage 0.3: the lock is held across the whole send -> save critical
         # section; for streams, ownership transfers to the response generator
         # via _release_chat_lock_stream (the final save_session happens there).
@@ -999,6 +1073,14 @@ async def handle_chat(
                 if fid not in ref_set:
                     await _db(record_file, fid, token_id)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
+        if json_mode:
+            # [v73] JSON 模式：提示层强约束（第一层防线；第二层出口校验在交付前）
+            prompt += (
+                "\n\n[OUTPUT FORMAT · 强制]\n"
+                "Respond with ONE valid JSON value (object, array, string, number or boolean) and NOTHING else.\n"
+                "No markdown fences, no explanations, no text before or after the JSON.\n"
+                "If you still need tool results, call tools first; once data is sufficient, output ONLY the final JSON."
+            )
         if resume_recovered and not is_first:
             # 接回中断会话：压制历史旧指令，防止模型反问"指令怎么不一样了"
             prompt = RESUME_NOTICE + prompt
@@ -1062,6 +1144,9 @@ async def handle_chat(
             _dump_stream_debug(session_id, resp_text)
             await _db(mark_active, token_id)
 
+            if json_mode:
+                # [v73] 第二层防线：出口校验 + 修复（提取合法 JSON，失败原样放行）
+                resp_text, _json_ok = _json_mode_coerce(resp_text)
             parsed_tools, clean_text = parse_tools(resp_text)
             clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
             clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
@@ -1076,7 +1161,11 @@ async def handle_chat(
 
             await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
             await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
-            return format_response(resp_text, model, messages, tools)
+            _resp = format_response(resp_text, model, messages, tools)
+            # [v74] 记录完成结果：窗口内同签名重试直接回放，不重复执行
+            if isinstance(_resp, dict) and "choices" in _resp:
+                _dup_record(sig, _resp)
+            return _resp
     except asyncio.CancelledError:
         # B2 (Stage 1 audit): the client went away mid-request — the exchange
         # never completed upstream, so the stored parent_message_id would fork
@@ -1493,6 +1582,15 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
 
         if not aborted and not failed:
+            # [v74] 记录完成结果：窗口内同签名重试直接回放，不重复执行
+            try:
+                _dup_record(sig, {
+                    "id": cid, "object": "chat.completion", "created": created, "model": model,
+                    "choices": [{"index": 0, "message": ast_msg,
+                                 "finish_reason": "tool_calls" if parsed_tools else "stop"}],
+                })
+            except Exception:
+                pass
             try:
                 if not parsed_tools:
                     for r in parser.flush():
@@ -1993,7 +2091,10 @@ async def chat_completions(request: Request):
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
-    return await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
+    # [v73] JSON 输出模式：仅当客户端显式声明时激活，正常请求零影响
+    resp_fmt = body.get("response_format") or {}
+    json_mode = isinstance(resp_fmt, dict) and resp_fmt.get("type") in ("json_object", "json_schema")
+    return await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request), json_mode=json_mode)
 
 
 def _responses_input_to_messages(inputs):
