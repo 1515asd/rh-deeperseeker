@@ -5,6 +5,7 @@ import ipaddress
 import json
 import mimetypes
 import contextlib
+import logging
 import os
 import re
 import socket
@@ -40,11 +41,22 @@ ROLLOVER_SAFETY_TOKENS = int(os.getenv("DEEPSEEKER_ROLLOVER_SAFETY_TOKENS", "240
 # 没有这个帽时，agent 客户端重放全量上下文的超大单条消息在每次重试中
 # 以同样方式失败（payload 从不缩小）。帽子放在观测到的首条可接受值
 # 略下方，截断后的 prompt 仍可通过。
+logger = logging.getLogger("uvicorn.error")
+
 MAX_USER_MESSAGE_TOKENS = int(os.getenv("DEEPSEEKER_MAX_USER_MESSAGE_TOKENS", "900000"))
 # [v77 DSH 移植] rollover 估算的固定开销：客户端可见历史里没有、但上游
 # 会话确实累积的部分——工具 schema、系统扩展、交接摘要、每轮指令和
 # 模型自己的跨轮推理。
 PROMPT_OVERHEAD_TOKENS = int(os.getenv("DEEPSEEKER_PROMPT_OVERHEAD_TOKENS", "4096"))
+# [v77.2] 会话绝对体重上限（token）：总量（客户端全量历史 + 固有开销）超过
+# 此值就无条件 rollover，与增长制并存。修的洞：增长制只看"比 baseline 厚
+# 了多少"，而首条走快速通道的会话可以一开场就背 60 万 token（生产实证
+# 2026-10-27 会话 a25da312：1.69MB 首条建会话成功后，每轮 prefill 60-75s，
+# growth≈0 永不触发换会话）。默认与记忆门槛一致（60 万），不额外降低记忆容量。
+# 绝对上限默认与记忆门槛一致（线上 env DEEPSEEKER_MEMORY_LIMIT_TOKENS=600000，
+# 2026-10-19 调整值）：门槛本意是"会话背负超过它就该换"，此前只检查增量、
+# 被首条巨包绕过——现在补全为增量/总量双判据，不额外降低记忆容量。
+SESSION_ABS_CEIL = int(os.getenv("DEEPSEEKER_SESSION_ABS_CEIL", "0"))  # 0 = 跟随记忆门槛
 # Token budget for the model-generated handoff summary.
 MAX_SUMMARY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_TOKENS", "4096"))
 
@@ -198,7 +210,20 @@ def needs_rollover(messages, baseline=0, tools=None):
         # is what the web backend's ~393K sliding window forgets. (Never
         # compare against the client-side total history: it monotonically
         # grows across rollovers and would fire on every request.)
-        return (total - baseline) > context_window_tokens()
+        if (total - baseline) > context_window_tokens():
+            return True
+        # [v77.2] 绝对封顶：会话总负重超限即换，与增长量无关。防死循环
+        # 依据：rollover 的新首条 = 运行时框架 + 摘要 + 最近上下文（几 KB），
+        # 不会立即再超限；全量首条（首条快速通道）只允许存在一轮。
+        _abs_ceil = SESSION_ABS_CEIL or context_window_tokens()
+        if total > _abs_ceil:
+            logger.warning(
+                "Session absolute ceiling hit: total=%d > %d tokens - forcing rollover "
+                "(giant first-message chat, per-turn prefill tax)",
+                total, _abs_ceil,
+            )
+            return True
+        return False
     # No baseline = this chat has no packed first message yet. The first
     # message rides the upstream first-message channel (observed ~975K
     # tokens accepted, and NOT subject to the sliding-window forgetting),
