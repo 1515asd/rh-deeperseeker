@@ -893,7 +893,8 @@ async def handle_chat(
                         next_sig = await generate_signature(next_messages, model, scope)
 
                         await _db(save_session, sig, new_token_id, new_session_id, next_parent(0))
-                        await _db(set_chat_baseline, new_session_id, _packed_first_message_tokens(messages))
+                        await _db(set_chat_baseline, new_session_id, _packed_first_message_tokens(messages),
+                                  estimate_conversation_tokens_cached(messages))
                         await _db(save_session, next_sig, new_token_id, new_session_id, next_parent(0))
                         if rot_owner is not None:
                             rot_owner.release()
@@ -958,7 +959,8 @@ async def handle_chat(
 
                 session_id = await create_new_chat(tok["token"])
                 await _db(save_session, sig, token_id, session_id, 0)
-                await _db(set_chat_baseline, session_id, _packed_first_message_tokens(messages))
+                await _db(set_chat_baseline, session_id, _packed_first_message_tokens(messages),
+                          estimate_conversation_tokens_cached(messages))
                 parent_message_id = 0
             else:
                 token_id = sess["token_id"]
@@ -1013,7 +1015,7 @@ async def handle_chat(
                 # parent_message_id (which would fork the upstream exchange).
                 parent_message_id = fresh["parent_message_id"]
 
-        _rollover_baseline = await _db(get_chat_baseline, session_id)
+        _rollover_baseline, _creation_total = await _db(get_chat_baseline, session_id)
         # [v72] 定期重建：除了上下文超限，会话轮数超过阈值也触发同一套
         # rollover 流程（删映射→生成摘要→新上游会话→按客户端真实历史全量
         # 重打包，重建后首条路径自动带任务锚点+对账单）。动机：长会话中
@@ -1021,7 +1023,7 @@ async def handle_chat(
         # ae65e2aa：数小时旧叙事淹没 30 秒前的金手指指令），且滑窗会无声
         # 丢失中段信息；定期重建等于定期把模型的世界观对齐到客户端账本。
         _rebuild_due = parent_message_id >= int(os.getenv("DEEPSEEKER_REBUILD_PARENT", "240"))
-        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline, tools=tools) or _rebuild_due or _force_rollover):
+        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline, tools=tools, creation_total=_creation_total) or _rebuild_due or _force_rollover):
             logger.info(
                 "Context rollover: accumulated context over limit%s; purging session mappings for chat %s",
                 " (periodic rebuild: parent=%d)" % parent_message_id if _rebuild_due else "",
@@ -1035,7 +1037,12 @@ async def handle_chat(
             rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
             session_id = await create_new_chat(tok["token"])
             await _db(save_session, sig, token_id, session_id, 0)
-            await _db(set_chat_baseline, session_id, len(rollover_summary) // 3 + estimate_conversation_tokens_cached(messages[-1:]))
+            # [v77.3] rollover 后记账：baseline=摘要版首条的实际 token（很小），
+            # creation_total=客户端全量（摘要代表全部旧历史）——增长从此处
+            # 重新起算，旧历史不再被算成"增长"（风暴根源）。
+            await _db(set_chat_baseline, session_id,
+                      len(rollover_summary) // 3 + estimate_conversation_tokens_cached(messages[-1:]),
+                      estimate_conversation_tokens_cached(messages))
             parent_message_id = 0
             # The rollover itself was serialized under the OLD chat's lock;
             # the send -> save section below must hold the FRESH chat's lock.

@@ -162,6 +162,18 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
     # [v77 P0-3 移植] 连续 403 计数：中间无成功轮的 403 次数。
     # mark_active() 与 restore_token() 归零。
+    # [v77.3] rollover 风暴修复：记录"建会话时的客户端历史总量"，
+    # 增长参照点从 baseline（首条实际 token）改为它——rollover 摘要会话的
+    # baseline 很小但代表全部旧历史，用 baseline 当参照会把没进会话的
+    # 旧历史全算成"增长"，导致每轮都触发 rollover（生产实证 2026-10-27
+    # 13:32-14:08：17 次连环 rollover，每 1.5-2 分钟一次）。
+    existing_cm_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(chat_memory)").fetchall()
+    }
+    if "creation_total" not in existing_cm_cols:
+        conn.execute(
+            "ALTER TABLE chat_memory ADD COLUMN creation_total REAL NOT NULL DEFAULT 0"
+        )
     if "consecutive_403" not in existing_cols:
         conn.execute(
             "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
@@ -1022,34 +1034,44 @@ def save_session(sig, token_id, session_id, parent_message_id=0):
 
 
 def get_chat_baseline(session_id):
-    """Conversation size (tokens) recorded when this upstream chat was opened.
+    """(baseline, creation_total) — 建会话时的两个记账值。
 
-    Rollover compares GROWTH since the chat was opened against the window
-    instead of re-measuring the whole ever-growing client history (which would
-    fire a fresh rollover on every single turn). Returns 0 when unknown.
-    """
+    baseline：本会话首条实际进入上游的 token 数（首条快速通道的负重）。
+    creation_total：建会话那一刻客户端全量历史的 token 数——增长参照点。
+    Rollover 比较 GROWTH（= 当前全量 - creation_total）而不是重测整个
+    只增不减的客户端历史（否则每一轮都触发一次全新 rollover）。
+    旧行（无 creation_total 列）返回 creation_total=0，调用方回退用
+    baseline 当参照（与 v72-v76 行为一致）。"""
     if not session_id:
-        return 0
+        return 0, 0
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT baseline FROM chat_memory WHERE session_id = ?", (session_id,)
+            "SELECT baseline, creation_total FROM chat_memory WHERE session_id = ?", (session_id,)
         ).fetchone()
-        return int(row[0]) if row and row[0] is not None else 0
+        if not row or row[0] is None:
+            return 0, 0
+        ct = int(row[1]) if (len(row) > 1 and row[1] is not None) else 0
+        return int(row[0]), ct
     finally:
         conn.close()
 
 
-def set_chat_baseline(session_id, baseline):
-    """Record the conversation size at which this upstream chat was opened."""
+def set_chat_baseline(session_id, baseline, creation_total=0):
+    """Record the conversation size at which this upstream chat was opened.
+
+    baseline：首条实际进入上游的 token 数；creation_total：那一刻客户端
+    全量历史的 token 数（增长参照点）。"""
     if not session_id:
         return
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO chat_memory (session_id, baseline, created_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(session_id) DO UPDATE SET baseline = excluded.baseline",
-            (session_id, int(baseline or 0), time.time()),
+            "INSERT INTO chat_memory (session_id, baseline, created_at, creation_total) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET baseline = excluded.baseline, "
+            "creation_total = excluded.creation_total",
+            (session_id, int(baseline or 0), time.time(), int(creation_total or 0)),
         )
         conn.commit()
     finally:

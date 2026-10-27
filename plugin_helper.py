@@ -172,7 +172,7 @@ def estimate_conversation_tokens_cached(messages):
     return est
 
 
-def needs_rollover(messages, baseline=0, tools=None):
+def needs_rollover(messages, baseline=0, tools=None, creation_total=0):
     """Decide keep-current-chat vs summarize-and-roll-over.
 
     Returns True when the accumulated session context is nearing the observed
@@ -205,22 +205,27 @@ def needs_rollover(messages, baseline=0, tools=None):
             total += count_tokens(json.dumps(tools))
     total += PROMPT_OVERHEAD_TOKENS
     if baseline and baseline > 0:
-        # baseline = the size of THIS chat's first packed message; growth
-        # since then approximates the in-session accumulated context, which
-        # is what the web backend's ~393K sliding window forgets. (Never
-        # compare against the client-side total history: it monotonically
-        # grows across rollovers and would fire on every request.)
-        if (total - baseline) > context_window_tokens():
+        # [v77.3 风暴修复] 增长参照点 = creation_total（建会话时客户端历史
+        # 总量）。v77.2 的错误：参照点用 baseline（首条实际 token）——
+        # rollover 摘要会话的 baseline 很小、却"代表"全部旧历史，用小
+        # baseline 减出来的"增长"其实是没进会话的旧历史 → 巨历史任务
+        # 每轮都触发 rollover（生产实证：13:32-14:08 连环 17 次，每
+        # 1.5-2 分钟换一次会话，模型每轮从摘要失忆重读——"读了又读
+        # 不给结果"）。
+        growth_ref = creation_total if creation_total and creation_total > 0 else baseline
+        # 滑窗遗忘判据：建会话以来的真实新增超过窗口
+        if (total - growth_ref) > context_window_tokens():
             return True
-        # [v77.2] 绝对封顶：会话总负重超限即换，与增长量无关。防死循环
-        # 依据：rollover 的新首条 = 运行时框架 + 摘要 + 最近上下文（几 KB），
-        # 不会立即再超限；全量首条（首条快速通道）只允许存在一轮。
+        # [v77.2→v77.3 修正] 背负判据：首条实际进上游的量 + 建会话以来
+        # 真实新增 = 上游会话的真实 prefill 负担。rollover 摘要会话的
+        # 负担 ≈ 摘要 + 少量新增，远小于全量 → 不再每轮触发。
+        burden = baseline + max(0, total - growth_ref)
         _abs_ceil = SESSION_ABS_CEIL or context_window_tokens()
-        if total > _abs_ceil:
+        if burden > _abs_ceil:
             logger.warning(
-                "Session absolute ceiling hit: total=%d > %d tokens - forcing rollover "
-                "(giant first-message chat, per-turn prefill tax)",
-                total, _abs_ceil,
+                "Session burden ceiling hit: burden=%d > %d tokens "
+                "(baseline=%d, growth=%d) - forcing rollover",
+                burden, _abs_ceil, baseline, total - growth_ref,
             )
             return True
         return False
