@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import mimetypes
+import contextlib
 import os
 import re
 import socket
@@ -12,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
-from functions import get_session, upload_file, count_tokens
+from functions import get_session, upload_file, count_tokens, request_effort
 
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
@@ -34,6 +35,16 @@ OBSERVED_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEKER_MAX_OUTPUT_TOKENS", "8192
 # Covers tokenizer estimation error against the web backend plus the summary
 # request/reply exchange that happens in the current chat before rollover.
 ROLLOVER_SAFETY_TOKENS = int(os.getenv("DEEPSEEKER_ROLLOVER_SAFETY_TOKENS", "24000"))
+# [v77 DSH 移植] 提示词里内嵌的最新用户消息硬上限。首条消息上游可吃
+# ~100 万 token，但超过此上限的任何 payload 永远不可能成功——而旧实现
+# 没有这个帽时，agent 客户端重放全量上下文的超大单条消息在每次重试中
+# 以同样方式失败（payload 从不缩小）。帽子放在观测到的首条可接受值
+# 略下方，截断后的 prompt 仍可通过。
+MAX_USER_MESSAGE_TOKENS = int(os.getenv("DEEPSEEKER_MAX_USER_MESSAGE_TOKENS", "900000"))
+# [v77 DSH 移植] rollover 估算的固定开销：客户端可见历史里没有、但上游
+# 会话确实累积的部分——工具 schema、系统扩展、交接摘要、每轮指令和
+# 模型自己的跨轮推理。
+PROMPT_OVERHEAD_TOKENS = int(os.getenv("DEEPSEEKER_PROMPT_OVERHEAD_TOKENS", "4096"))
 # Token budget for the model-generated handoff summary.
 MAX_SUMMARY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_TOKENS", "4096"))
 
@@ -149,7 +160,7 @@ def estimate_conversation_tokens_cached(messages):
     return est
 
 
-def needs_rollover(messages, baseline=0):
+def needs_rollover(messages, baseline=0, tools=None):
     """Decide keep-current-chat vs summarize-and-roll-over.
 
     Returns True when the accumulated session context is nearing the observed
@@ -173,6 +184,14 @@ def needs_rollover(messages, baseline=0):
     ):
         return False
     total = estimate_conversation_tokens_cached(messages)
+    # [v77 DSH 移植] 估算补上客户端可见文本之外、上游会话实际背负的
+    # 部分——工具 schema 块（十几个工具会在上游多占 1-2 万 token，旧
+    # 估算完全看不见）加上系统扩展/交接摘要/每轮指令的固定开销。
+    # 不补的话，估算越过阈值时上游会话早已死亡。
+    if tools:
+        with contextlib.suppress(TypeError, ValueError):
+            total += count_tokens(json.dumps(tools))
+    total += PROMPT_OVERHEAD_TOKENS
     if baseline and baseline > 0:
         # baseline = the size of THIS chat's first packed message; growth
         # since then approximates the in-session accumulated context, which
@@ -261,6 +280,28 @@ SUMMARY_INSTRUCTION = (
     "- if images, files, or other attachments were shared, describe what they showed and what mattered from them, without including the attachments.\n\n"
     "Keep the summary compact. Prefer the newest and most relevant information if the conversation is long or was truncated."
 )
+
+
+# [v77 PR#72 移植] DeepSeek 网页端只有一个思考开关（DeepThink 开/关），
+# medium 以上的 effort 只能用"要求更多推理"来近似；实测思考时长
+# ~1.1-2.4 倍。"high" 不给指令：agent 会话里它让推理长度暴涨
+# （中位 452 -> 7401 字符），长推理会撞上 DeepSeek 的截断（INCOMPLETE）。
+EFFORT_INSTRUCTIONS = {
+    "max": (
+        "[REASONING EFFORT: max] Before answering, reason exhaustively in your thinking: try at least two "
+        "different approaches, check edge cases, verify every step and re-check the final answer "
+        "independently. Take as long as needed."
+    ),
+}
+for _alias in ("xhigh", "ultra", "extreme"):
+    EFFORT_INSTRUCTIONS[_alias] = EFFORT_INSTRUCTIONS["max"]
+
+
+def _with_effort(prompt):
+    instruction = EFFORT_INSTRUCTIONS.get(request_effort.get() or "")
+    if not instruction:
+        return prompt
+    return prompt + "\n\n" + instruction + "\n"
 
 
 def build_summary_request_prompt(messages):
@@ -830,8 +871,11 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
             final_prompt += f"[TOOL RESULTS]（以下是你最近一次工具调用的返回结果，每条 Result 上方的 Command 就是引发它的调用原文，结果与命令一一对应）\n{relevant_tool_results}\n\n"
         user_msg = await extract_user_msg(messages)
         if user_msg:
+            # [v77 DSH 移植] 最新用户消息硬上限（rollover 分支）
+            user_msg = _trim_to_budget(user_msg, MAX_USER_MESSAGE_TOKENS)
             final_prompt += f"[USER]\n{user_msg}\n\n"
-        return final_prompt.strip() + "\n\n"
+        # [v77 PR#72 移植] effort 档位映射（rollover 分支返回前）
+        return _with_effort(final_prompt.strip() + "\n\n")
     if is_first_message:
         final_prompt = await append_fresh_session_runtime(final_prompt, messages, tools_extract)
 
@@ -861,6 +905,8 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
 
         user_msg = await extract_user_msg(messages)
         if user_msg:
+            # [v77 DSH 移植] 最新用户消息硬上限（首条路径）
+            user_msg = _trim_to_budget(user_msg, MAX_USER_MESSAGE_TOKENS)
             final_prompt += f"[USER]\n{user_msg}\n\n"
     else:
         last_ast_idx = -1
@@ -902,7 +948,9 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
                         trailing_user_parts.append(txt)
 
         if trailing_user_parts:
-            final_prompt += f"[USER]\n{chr(10).join(trailing_user_parts)}\n\n"
+            # [v77 DSH 移植] 最新用户消息硬上限（续话路径）
+            _user_blob = _trim_to_budget(chr(10).join(trailing_user_parts), MAX_USER_MESSAGE_TOKENS)
+            final_prompt += f"[USER]\n{_user_blob}\n\n"
         elif not tools_result_extract:
             user_msg = await extract_user_msg(messages)
             if user_msg:
@@ -911,4 +959,5 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         if tools_extract:
             final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
 
-    return final_prompt
+    # [v77 PR#72 移植] effort 档位映射
+    return _with_effort(final_prompt)

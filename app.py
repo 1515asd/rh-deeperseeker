@@ -11,7 +11,7 @@ import time
 import unicodedata
 import uuid
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from urllib.parse import urlparse
 
@@ -36,6 +36,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 先删掉上一条回复（消息列表变化 → 签名不同 → 不受影响）。
 _DUP_CACHE = {}
 _DUP_CACHE_MAX = 256
+
+
+def _dup_dbg(msg):
+    try:
+        with open(os.path.join(BASE_DIR, "dup_debug.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S") + " " + msg + "\n")
+    except Exception:
+        pass
 
 
 def _dup_record(sig, body):
@@ -155,6 +163,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 security = HTTPBasic()
 
 
+import official_api
 from functions import (
     CookieGenerationError,
     UpstreamError,
@@ -173,6 +182,13 @@ from functions import (
     init_db,
     mark_limited,
     mark_active,
+    is_context_limit_error,
+    record_usage,
+    usage_by_day_key,
+    get_pool_view,
+    effort_level,
+    request_effort as _request_effort,
+    request_tools as _request_tools,
     next_parent,
     parse_tools,
     pick_token,
@@ -772,7 +788,11 @@ async def handle_chat(
     _auth_rotated=False,
     _exclude_token=None,
     json_mode=False,
+    _force_rollover=False,
 ):
+    # [v77 PR#70/72 移植] 把请求级信息放进 ContextVar：parse_tools 反推
+    # 工具名用工具表；build_prompt 挂 effort 指令用档位。
+    _request_tools.set(tools or [])
     auth_token = await _db(get_auth_token)
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
@@ -820,7 +840,7 @@ async def handle_chat(
                         await _db(delete_sessions_for_chat, token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
                         rot_owner = await _own_chat_lock(new_session_id)
-                        if needs_rollover(messages):
+                        if needs_rollover(messages, tools=tools):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
                                 scratch_chat, new_tok["token"], build_summary_request_prompt(messages), 0, False, False, []
@@ -924,7 +944,7 @@ async def handle_chat(
                 # that summary via build_prompt(rollover_summary=...). A single large
                 # first exchange is untouched (the first-message path accepts ~1M
                 # tokens); this only fires for accumulated session context.
-                if needs_rollover(messages):
+                if needs_rollover(messages, tools=tools):
                     scratch_chat = await create_new_chat(tok["token"])
                     summary_gen = send_message(
                         scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
@@ -1001,7 +1021,7 @@ async def handle_chat(
         # ae65e2aa：数小时旧叙事淹没 30 秒前的金手指指令），且滑窗会无声
         # 丢失中段信息；定期重建等于定期把模型的世界观对齐到客户端账本。
         _rebuild_due = parent_message_id >= int(os.getenv("DEEPSEEKER_REBUILD_PARENT", "240"))
-        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline) or _rebuild_due):
+        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline, tools=tools) or _rebuild_due or _force_rollover):
             logger.info(
                 "Context rollover: accumulated context over limit%s; purging session mappings for chat %s",
                 " (periodic rebuild: parent=%d)" % parent_message_id if _rebuild_due else "",
@@ -1046,6 +1066,7 @@ async def handle_chat(
         # 消息列表变化 → 签名不同 → 不受影响。
         if not is_anthropic:
             cached_body = _dup_lookup(sig)
+            _dup_dbg(f"lookup sig={str(sig)[:16]} hit={cached_body is not None} cache_n={len(_DUP_CACHE)}")
             if cached_body is not None:
                 logger.warning(
                     "[dup-guard] sig=%s 窗口内已完成，回放缓存结果（不重复执行）",
@@ -1089,8 +1110,19 @@ async def handle_chat(
             # 滑窗（~65 万）逐渐挤出；且历史里积累的畸形 DSML 输出会被模型
             # 模仿（恶性循环）。对策：每轮在最新消息末尾重申迷你铁律——它
             # 永远在滑窗之内，长对话中遵从度不衰减。成本 ~100 token/轮。
-            _recent_tail = json.dumps(messages[-6:], ensure_ascii=False, default=str)
-            if re.search(r"Tool call rejected|missing required parameter|参数为空|arguments (?:were |)empty|invalid tool call", _recent_tail, re.I):
+            # [v75-c] 警告牌去粘性：旧实现扫最近 6 条消息，客户端历史里滞留的
+            # 旧拒绝记录会让调用成功后仍持续贴牌（生产实证 2026-10-25 会话
+            # e1751fe3：11 次贴牌 3 次误贴，全是成功后误贴，加剧模型格式摇摆）。
+            # 新实现只认"最近一条工具结果"：窗口内最后一条 role=tool 消息是
+            # 拒绝才贴牌；陈年错误（滑出最近 3 条）不翻出来骂。历史全量统计：
+            # 旧规则 8 正确 + 3 误贴 + 0 漏贴；新规则 8 正确 + 0 误贴 + 0 漏贴。
+            _last_tool_rejected = False
+            for _m in messages[-3:]:
+                if isinstance(_m, dict) and _m.get("role") == "tool":
+                    _last_tool_rejected = bool(re.search(
+                        r"Tool call rejected|missing required parameter|参数为空|arguments (?:were |)empty|invalid tool call",
+                        str(_m.get("content") or ""), re.I))
+            if _last_tool_rejected:
                 # 客户端回传了工具拒绝/参数错误反馈：用户不必再手动提醒，
                 # 服务端检测到后自动加码。
                 prompt += (
@@ -1162,9 +1194,20 @@ async def handle_chat(
             await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
             await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
             _resp = format_response(resp_text, model, messages, tools)
+            # [v77 P0-6 审计补漏] OpenAI 非流式完成轮的用量落库——此前只在
+            # 流式（stream_response）与 Anthropic 非流式路径落库，OpenAI
+            # 非流式完成轮漏记（线上实证 2026-10-27：工具轮无 usage 行）。
+            # 此处即成功路径（失败走上方 except），无需 failed 判断
+            with suppress(Exception):
+                _u = (_resp or {}).get("usage") or {}
+                await _db(record_usage, scope or "unknown", "openai",
+                          req_model or model,
+                          _u.get("prompt_tokens") or _count_messages_tokens(messages),
+                          _u.get("completion_tokens") or count_tok(_completion_usage_text(clean_text, parsed_tools)))
             # [v74] 记录完成结果：窗口内同签名重试直接回放，不重复执行
             if isinstance(_resp, dict) and "choices" in _resp:
                 _dup_record(sig, _resp)
+                _dup_dbg(f"record sig={str(sig)[:16]}")
             return _resp
     except asyncio.CancelledError:
         # B2 (Stage 1 audit): the client went away mid-request — the exchange
@@ -1176,7 +1219,7 @@ async def handle_chat(
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             if not _auth_rotated:
                 new_token_id = await _db(pick_token)
@@ -1213,6 +1256,16 @@ async def handle_chat(
 
         logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         await _db(delete_sessions_for_chat, token_id, session_id)
+        # [v77 PR#67 移植] 上下文属于上游 CHAT 而不属于 TOKEN——普通重试
+        # （换号、同会话）必然同样死亡。分类为上下文型失败时，重试强制走
+        # 摘要 rollover；每轮最多一次（force 标志不粘滞，review fix）。
+        _force_rollover_next = bool(is_context_limit_error(e)) and not _force_rollover
+        if _force_rollover_next:
+            logger.warning(
+                "Context-class upstream failure on chat %s (%s); retry will force a summary rollover",
+                session_id,
+                e,
+            )
         if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
             # B10: budget exhausted — surface the (already redacted/truncated)
             # upstream error instead of retrying forever.
@@ -1244,6 +1297,7 @@ async def handle_chat(
             _attempt=_attempt + 1,
             _auth_rotated=_auth_rotated,
             _exclude_token=token_id,
+            _force_rollover=_force_rollover_next,
         )
     finally:
         if not lock_transferred:
@@ -1554,7 +1608,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         else:
@@ -1619,6 +1673,10 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 usage_chunk = _chat_chunk([], cid=cid, created=created, model=model)
                 usage_chunk["usage"] = {"prompt_tokens": in_tokens, "completion_tokens": out_tokens, "total_tokens": in_tokens + out_tokens}
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
+                # [v77 P0-6 移植] 完成轮用量落库（客户端可见成功才记，
+                # 失败/中止流不记——重试只计一次是结构性规则）
+                with suppress(Exception):
+                    await _db(record_usage, scope or "unknown", "openai", model, in_tokens, out_tokens)
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
                 pass
@@ -1698,7 +1756,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         else:
@@ -1720,6 +1778,10 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         out_tokens = count_tok(usage_out) if usage_out else 0
 
         if not failed:
+            # [v77 P0-6 移植] 非流式完成轮用量落库
+            with suppress(Exception):
+                await _db(record_usage, scope or "unknown", "anthropic", req_model or model,
+                          _count_messages_tokens(messages), out_tokens)
             next_messages = messages.copy()
             ast_msg = {"role": "assistant"}
             if parsed_tools:
@@ -1889,6 +1951,16 @@ def format_anthropic_response(result, model):
 async def files_upload(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    # [v77 PR#72 审计修复] effort 档位在此设置（此前链路断裂：
+    # request_effort 无人 set，max 档指令从未挂上）
+    _request_effort.set(effort_level(body) if isinstance(body, dict) else None)
+    # [v77 P0-7] 显式模式开关：DEEPSEEKER_MODE=official 时走官方 API，
+    # 无静默回退。
+    if official_api.official_mode_enabled():
+        _body = await request.json()
+        return await _official_chat_response(
+            _body, _body.get("model") or "deepseek-chat",
+            bool(_body.get("stream")), _body.get("tools"), request)
     tok_id = await _db(pick_token)
     if not tok_id:
         return JSONResponse({"error": "No tokens available"}, status_code=503)
@@ -2074,6 +2146,64 @@ async def _json_body(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
     return body
+
+
+# ============ [v77 P0-7 移植] 官方 API 直通（DEEPSEEKER_MODE=official 显式开启） ============
+_OFFICIAL_PASSTHROUGH_FIELDS = (
+    "messages",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "response_format",
+    "stop",
+)
+
+
+async def _official_chat_response(body, model, stream, tools, request):
+    """[v77 P0-7] 用官方 API 服务 /v1/chat/completions。
+
+    同一鉴权（调用方已查）、同一种用量记录（surface='official'、掩码 key、
+    上游报真实 usage）、工具按原生 OpenAI 格式转发。官方 key 永不进日志
+    或错误体（official_api 内部脱敏）。"""
+    payload = {k: body[k] for k in _OFFICIAL_PASSTHROUGH_FIELDS if k in body}
+    payload["model"] = official_api.map_model(model)
+    if tools:
+        payload["tools"] = tools
+    if not stream:
+        try:
+            result = await official_api.official_chat(payload, stream=False)
+        except UpstreamError as e:
+            return _api_error_response(e, is_anthropic=False)
+        usage = result.get("usage") or {}
+        with suppress(Exception):
+            await _db(record_usage, get_api_key(request), "official",
+                      result.get("model") or payload["model"],
+                      usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        return JSONResponse(result)
+    scope = get_api_key(request)
+
+    async def _gen():
+        total_in = total_out = 0
+        try:
+            async for line in official_api.official_chat(payload, stream=True):
+                if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                    try:
+                        chunk = json.loads(line[len("data: "):])
+                        usage = chunk.get("usage")
+                        if usage:
+                            total_in = usage.get("prompt_tokens", total_in)
+                            total_out = usage.get("completion_tokens", total_out)
+                    except json.JSONDecodeError:
+                        pass
+                yield line
+        except UpstreamError as e:
+            with suppress(Exception):
+                yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
+            return
+        with suppress(Exception):
+            await _db(record_usage, scope, "official", payload["model"], total_in, total_out)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 @app.post("/v1/chat/completions")
@@ -2445,6 +2575,105 @@ async def dashboard(request: Request):
     return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
 
 
+@app.post("/v1/pool/restore")
+async def v1_pool_restore(request: Request):
+    """[v77 P0-3] 恢复隔离账号（管理员手动操作，隔离的唯一出口）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    try:
+        body = await request.json()
+        token_id = int(body.get("token_id"))
+    except Exception:
+        return JSONResponse({"error": "token_id required"}, status_code=400)
+    await _db(restore_token, token_id)
+    return JSONResponse({"ok": True, "token_id": token_id})
+
+
+@app.get("/pool")
+async def pool_dashboard(request: Request):
+    """[v77 P0-3/P0-6 移植] 池状态 + 用量统计可视化页（管理员）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    return HTMLResponse("""<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>账号池与用量</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px}
+h1{font-size:20px} h2{font-size:16px;margin:24px 0 8px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #334155;padding:6px 10px;text-align:left}
+th{background:#1e293b;color:#94a3b8}
+.ok{color:#4ade80}.warn{color:#fbbf24}.err{color:#f87171}
+button{background:#334155;color:#e2e8f0;border:0;border-radius:4px;padding:3px 10px;cursor:pointer}
+button:hover{background:#475569}
+.meta{color:#64748b;font-size:12px;margin-top:16px}
+</style></head><body>
+<h1>账号池状态 <span class="meta" id="ts"></span></h1>
+<table id="pool"><thead><tr><th>ID</th><th>别名</th><th>状态</th><th>说明</th><th>进行中</th><th>上次使用</th><th>冷却</th><th>操作</th></tr></thead><tbody></tbody></table>
+<h2>用量统计（按天 × 按 key）</h2>
+<table id="usage"><thead><tr><th>日期</th><th>Key</th><th>通道</th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th></tr></thead><tbody></tbody></table>
+<div class="meta">每 10 秒自动刷新 · v77</div>
+<script>
+async function refresh(){
+  const [pool, usage] = await Promise.all([
+    fetch('/v1/pool').then(r=>r.json()).catch(()=>null),
+    fetch('/v1/usage').then(r=>r.json()).catch(()=>null),
+  ]);
+  if (pool && pool.pool){
+    const tb = document.querySelector('#pool tbody'); tb.innerHTML='';
+    for (const t of pool.pool){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${t.id}</td><td>${t.label}</td>`
+        + `<td class="${t.state_class}">${t.status}</td><td>${t.state_note}</td>`
+        + `<td>${t.in_flight}</td><td>${t.last_used}</td><td>${t.cooldown}</td>`
+        + `<td>${t.can_restore ? `<button onclick="restore(${t.id})">恢复</button>` : ''}</td>`;
+      tb.appendChild(tr);
+    }
+  }
+  if (usage && usage.usage){
+    const tb = document.querySelector('#usage tbody'); tb.innerHTML='';
+    for (const u of usage.usage){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${u.day}</td><td>${u.key}</td><td>${u.surfaces}</td>`
+        + `<td>${u.requests}</td><td>${u.input_tokens}</td><td>${u.output_tokens}</td>`;
+      tb.appendChild(tr);
+    }
+  }
+  document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+}
+async function restore(id){
+  await fetch('/v1/pool/restore', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token_id:id})});
+  refresh();
+}
+refresh(); setInterval(refresh, 10000);
+</script></body></html>""")
+
+
+@app.get("/v1/usage")
+async def v1_usage(request: Request):
+    """[v77 P0-6] 用量统计 JSON（管理员）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    since = float(request.query_params.get("since", "0") or 0)
+    return JSONResponse({"usage": await _db(usage_by_day_key, since)})
+
+
+@app.get("/v1/pool")
+async def v1_pool(request: Request):
+    """[v77 P0-3] 账号池运维视图 JSON（管理员，无凭据字段）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    return JSONResponse({"pool": await _db(get_pool_view)})
+
+
 @app.post("/tokens/add")
 async def tokens_add(request: Request):
     try:
@@ -2474,8 +2703,45 @@ async def root(request: Request):
     return await dashboard(request)
 
 
+async def _deep_health_probe():
+    """[v77 P0-9 移植] 一次端到端上游往返（含 PoW）：创建空聊天会话。
+
+    成本：每次调用一个空上游会话——这是本桥能跑的最诚实的探针，因为
+    会话创建正是 PoW/客户端版本/账号死亡时最先断的那一跳。探针从不发
+    消息，也绝不报告 token 材料。状态感知选号：走 pick_token()，跳过
+    隔离与冷却中的行（旧式抓第一行的做法会误报降级、还会把上游流量
+    送进已知死亡的凭据）。"""
+    token_id = await _db(pick_token)
+    auth_token = None
+    if token_id is not None:
+        with suppress(Exception):
+            for t in await _db(get_tokens):
+                if t["id"] == token_id:
+                    auth_token = t.get("token")
+                    break
+    if not auth_token:
+        return {"upstream_reachable": False, "pow_ok": False, "latency_ms": None,
+                "reason": "no ACTIVE token in pool"}
+    started = time.perf_counter()
+    try:
+        await create_new_chat(auth_token)
+    except Exception as e:
+        logger.warning("Deep health probe failed: %s", e)
+        return {"upstream_reachable": False, "pow_ok": False,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                "reason": "upstream error"}
+    return {"upstream_reachable": True, "pow_ok": True,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "session_created": True}
+
+
 @app.get("/health")
 async def health(request: Request):
+    # [v77 P0-9 移植] ?deep=1 需要鉴权，且 401 先于任何上游流量——
+    # 浅层检查保持公开，探针永远不能被当成免费中转测试器。
+    deep = (request.query_params.get("deep") or "").strip().lower() in ("1", "true", "yes")
+    if deep and not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
     active = sum(1 for t in await _db(get_tokens) if t["status"] == "ACTIVE")
     cookies_valid = False
     try:
@@ -2492,6 +2758,14 @@ async def health(request: Request):
     if check_key(request):
         data["active_tokens"] = active
         data["cookies_valid"] = cookies_valid
+        data["version"] = "v77"
+        # [v77 P0-9 移植] 深度探针：真实端到端上游往返
+        if deep:
+            probe = await _deep_health_probe()
+            data["deep"] = probe
+            if probe.get("upstream_reachable") is not True:
+                data["status"] = "degraded"
+                ok = False
     return JSONResponse(data, status_code=200 if ok else 503)
 
 

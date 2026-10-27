@@ -25,9 +25,16 @@ import re
 import time
 import uuid
 
+from contextvars import ContextVar
+
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger("uvicorn.error")
+
+# [v77 P0-4 移植] 每请求关联 id，同一请求调用链的任何位置可读
+# （终态空 SSE 信封内嵌它，失败响应可对上访问日志行）。纯 ASGI 中间件
+# 在同一 task 里跑路由栈，普通 ContextVar 即安全。
+request_id_var = ContextVar("deeperseeker_request_id", default="-")
 
 
 # ==============================================================================
@@ -158,6 +165,7 @@ class RequestIDMiddleware:
                 break
         request_id = inbound if _REQUEST_ID_RE.match(inbound or "") else uuid.uuid4().hex
         state["request_id"] = request_id
+        request_id_var.set(request_id)
 
         started = time.perf_counter()
         status_holder = {"status": None}

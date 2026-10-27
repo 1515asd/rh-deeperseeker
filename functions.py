@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import base64
 import json
 import logging
@@ -159,6 +160,30 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
     if "last_used" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
+    # [v77 P0-3 移植] 连续 403 计数：中间无成功轮的 403 次数。
+    # mark_active() 与 restore_token() 归零。
+    if "consecutive_403" not in existing_cols:
+        conn.execute(
+            "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
+        )
+    # [v77 P0-6 移植] usage 统计：每个"客户端可见成功"的完成轮一行，
+    # 读取时按 天×掩码key 聚合。保留原始行而非预聚合计数器——
+    # 失败的尝试没有行可记，"重试只计一次"成为结构性规则。
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            day TEXT NOT NULL,
+            key_alias TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
+    )
     existing_session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
@@ -537,6 +562,11 @@ def delete_token(token_id):
 #   * a soonest-to-recover fallback when every token is still cooling down.
 # ==============================================================================
 
+# [v77 P0-3 移植] 连续 403 达到该次数（中间无成功轮）即视为封号阶梯，
+# 账号退出轮换，直到管理员手动恢复。0 = 关闭升级（维持只冷却的旧行为）；
+# 401 无条件隔离。
+QUARANTINE_AFTER_403 = max(0, int(os.getenv("DEEPSEEKER_QUARANTINE_AFTER_403", "3")))
+
 TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
 TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
 
@@ -604,6 +634,8 @@ def pick_token(exclude=None):
     available = []
     recovered = []
     for tid, status, until, last_used in rows:
+        if status == "QUARANTINED":
+            continue  # [v77 P0-3] 终态：仅 restore_token() 可恢复
         if status == "RATE_LIMITED" and until is not None and until > now:
             continue  # still cooling down
         if status == "RATE_LIMITED":
@@ -636,13 +668,84 @@ def pick_token(exclude=None):
     # with no backoff at all.
     conn = get_db()
     row = conn.execute(
-        "SELECT id FROM tokens ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
+        "SELECT id FROM tokens WHERE status != 'QUARANTINED' "
+        "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
     ).fetchone()
     conn.close()
     return row[0] if row else None
 
 
-def mark_limited(token_id):
+def mark_quarantined(token_id, reason):
+    """[v77 P0-3 移植] 账号退出轮换，直到管理员恢复。
+
+    与 RATE_LIMITED 不同：此状态没有计时器——rate_limited_until 清空，
+    pick_token() 的自动恢复永远不会把隔离行误认成冷却完毕的行。
+    """
+    logger.warning("Token #%d QUARANTINED (manual return required): %s", token_id, reason)
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL WHERE id = ?",
+        ("QUARANTINED", token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def restore_token(token_id):
+    """[v77 P0-3 移植] 隔离的唯一出口：管理员显式操作。
+
+    last_used 刻意不动——恢复的账号带着最旧的用量戳，
+    idle-oldest 决胜会让它温和回到轮换，而不是被灌一波突发流量。
+    """
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
+        "consecutive_403 = 0 WHERE id = ?",
+        ("ACTIVE", token_id),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Token #%d restored to ACTIVE by operator", token_id)
+
+
+def _bump_403_streak(token_id):
+    """[v77 P0-3 移植] 递增并返回该账号的连续 403 计数。"""
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET consecutive_403 = consecutive_403 + 1 WHERE id = ?",
+        (token_id,),
+    )
+    row = conn.execute(
+        "SELECT consecutive_403 FROM tokens WHERE id = ?", (token_id,)
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return row[0] if row else 0
+
+
+def mark_limited(token_id, code=None):
+    """[v77 P0-3 移植] 向账号记一次上游失败——池的唯一门户。
+
+    不带 code：与既有行为完全一致（RATE_LIMITED 冷却自动恢复）。
+    带上游状态码：
+      * 401 -> 立即 QUARANTINED。被拒的凭据不是暂态，冷却 60 秒只会
+        把同一个死账号重新武装。
+      * 403 -> 照旧冷却；连续 403 达到 QUARANTINE_AFTER_403（中间无
+        成功轮）则 QUARANTINED。
+      * 其他（429）-> 冷却，照旧。
+    """
+    if code == 401:
+        mark_quarantined(token_id, "upstream 401 (auth rejected)")
+        return
+    if code == 403:
+        streak = _bump_403_streak(token_id)
+        threshold = QUARANTINE_AFTER_403
+        if threshold and streak >= threshold:
+            mark_quarantined(
+                token_id,
+                f"{streak} consecutive upstream 403s (threshold {threshold})",
+            )
+            return
     until = time.time() + TOKEN_COOLDOWN_SECONDS
     logger.warning(
         "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
@@ -659,13 +762,195 @@ def mark_limited(token_id):
 
 
 def mark_active(token_id):
+    """[v77 P0-3 移植] 记一次成功轮：回到轮换、连续计数清零。
+
+    QUARANTINED 行刻意不动：请求会重叠，隔离前的发送可能在拉黑之后
+    才落地成功；放行会污染管理员控制的状态，只有 restore_token()
+    能结束隔离。
+    """
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ? WHERE id = ?",
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
+        "consecutive_403 = 0 WHERE id = ? AND status != 'QUARANTINED'",
         ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
     conn.close()
+
+
+def _format_span(seconds):
+    """[v77 P0-3 移植] 池视图的紧凑时长：42s / 7m / 3h / 2d。"""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def get_pool_view():
+    """[v77 P0-3 移植] 每账号的运维视图。
+
+    状态、负载、计时器以可直接渲染的字符串给出，且不含任何凭据字段：
+    token 列刻意缺席——此输出直接进 HTML，浏览器会缓存、截图会带走。
+    """
+    now = time.time()
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403 "
+        "FROM tokens ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    view = []
+    for tid, alias, status, until, last_used, streak in rows:
+        streak = streak or 0
+        if status == "QUARANTINED":
+            state_class, cooldown = "err", "—"
+            note = "quarantined — manual return required"
+        elif status == "RATE_LIMITED" and until and until > now:
+            state_class, cooldown = "warn", f"{_format_span(until - now)} left"
+            note = "cooling down, recovers automatically"
+        elif status == "RATE_LIMITED":
+            state_class, cooldown = "warn", "expired"
+            note = "rejoins rotation on the next pick"
+        else:
+            state_class, cooldown = "ok", "—"
+            note = "in rotation"
+        if streak and status != "QUARANTINED":
+            note = f"{note}, 403 streak {streak}"
+        age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
+        view.append(
+            {
+                "id": tid,
+                "label": alias if alias else f"untagged #{tid}",
+                "status": status,
+                "state_class": state_class,
+                "state_note": note,
+                "in_flight": _in_flight.get(tid, 0),
+                "last_used": age,
+                "cooldown": cooldown,
+                "can_restore": status == "QUARANTINED",
+            }
+        )
+    return view
+
+
+# ============ [v77 P0-6 移植] usage 统计 ============
+
+
+def mask_api_key(key):
+    """掩码 key 别名（展示用）：只留末 4 字符。
+
+    dashboard 与所有聚合都渲染它——页面截图不得携带可用 key 材料。
+    超短 key（<= 8 字符）整体掩码。"""
+    key = str(key or "").strip()
+    if not key:
+        return "unknown"
+    if len(key) <= 8:
+        return "…"
+    return "…" + key[-4:]
+
+
+def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None):
+    """[v77 P0-6 移植] 记一个完成轮。key_alias 应为已掩码值——
+    调用点传 mask_api_key(raw_key)；本函数绝不把裸 key 落库。"""
+    alias = (
+        mask_api_key(key_alias)
+        if key_alias and not str(key_alias).startswith("…")
+        else str(key_alias or "unknown")
+    )
+    when = time.time() if ts is None else float(ts)
+    day = time.strftime("%Y-%m-%d", time.gmtime(when))
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO usage (ts, day, key_alias, surface, model, input_tokens, output_tokens) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            when,
+            day,
+            alias,
+            str(surface or "unknown"),
+            str(model or ""),
+            max(0, int(in_tokens or 0)),
+            max(0, int(out_tokens or 0)),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def usage_by_day_key(since_ts=0.0):
+    """[v77 P0-6 移植] 按 天×掩码key 聚合用量。
+
+    返回可直接渲染的行。(day, key_alias) 索引覆盖 GROUP BY——
+    一个月的数据也只是几毫秒 SQLite，无需预聚合表。"""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT day, key_alias, "
+        "GROUP_CONCAT(DISTINCT surface), COUNT(*), "
+        "SUM(input_tokens), SUM(output_tokens) "
+        "FROM usage WHERE ts >= ? "
+        "GROUP BY day, key_alias ORDER BY day DESC, key_alias ASC",
+        (float(since_ts or 0.0),),
+    ).fetchall()
+    conn.close()
+
+    out = []
+    for day, alias, surfaces, requests, in_tok, out_tok in rows:
+        in_tok = in_tok or 0
+        out_tok = out_tok or 0
+        out.append(
+            {
+                "day": day,
+                "key": alias,
+                "surfaces": surfaces or "unknown",
+                "requests": requests,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+            }
+        )
+    return out
+
+
+# ============ [v77 PR#67 移植] 上下文超限错误分类器 ============
+
+_CONTEXT_LIMIT_HINT_RE = re.compile(
+    r"maximum.?context"
+    r"|context.?(?:length|limit|window)"
+    r"|token.?limit"
+    r"|(?:prompt|payload|conversation|messages?).{0,24}too.?long"
+    r"|exceed(?:ed|s)?[^.\n]{0,30}context",
+    re.IGNORECASE,
+)
+
+
+def is_context_limit_error(exc):
+    """[v77 PR#67 移植] 公开分类器：这次失败是不是上游会话上下文耗尽？
+
+    agent 客户端死在这里：上下文类失败曾被原样换号重试（上下文属于
+    CHAT 不属于 TOKEN，每次尝试都同样失败），最后才作为上下文错误
+    暴露给客户端。调用方用它触发摘要 rollover。匹配：
+      * UpstreamError 响应体带上下文措辞（HTTP 400 'maximum context
+        length' / 'context limit' / 'too long' 等）；
+    刻意不匹配：泛化 5xx/超时——'deadline exceeded'、'502 upstream
+    timeout' 是重试型，不是上下文型。松散词只在锚定上下文材料时
+    才算数：裸 'exceed' 或前面没有 prompt/message 的 'too long'
+    不再分类为上下文（上游 'header limit exceeded' 曾误触发一次
+    浪费的摘要 rollover）。"""
+    if isinstance(exc, UpstreamError):
+        body = getattr(exc, "body", None) or ""
+        return bool(_CONTEXT_LIMIT_HINT_RE.search(str(body)))
+    text = str(exc or "")
+    return bool(
+        re.search(
+            r"maximum.?context|context.?(?:length|limit|window)|token.?limit",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 def find_session(sig):
@@ -1171,8 +1456,90 @@ _EXACT_CALL_OPEN_RE = re.compile(r"<(?:tool_call|function_call)\s*>", re.IGNOREC
 _THINK_SPAN_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
+# [v75-a] DSML 参数外层包装名：模型模仿 OpenAI <tool_call> 结构时会把整个
+# arguments 包成一个 parameter。见到这些名字且值为对象时合并解包，消除
+# {"arguments": {...}} 双层嵌套（生产实证 2026-10-25 会话 e1751fe3）。
+_DSML_ARGS_WRAPPERS = {"arguments", "args", "parameters", "params"}
+
+
+# [v77 PR#70 移植] 当前请求的工具列表，由 handle_chat 设置，供 parse_tools
+# 在模型丢掉工具名时按 schema 反推调用归属。
+request_tools = contextvars.ContextVar("request_tools", default=None)
+
+
+def _tool_schemas():
+    schemas = {}
+    for t in request_tools.get() or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name")
+        params = fn.get("parameters") or fn.get("input_schema") or {}
+        if name and isinstance(params, dict):
+            schemas[name] = params
+    return schemas
+
+
+def _infer_tool_name(args, schemas):
+    """[v77 PR#70 移植] 按 schema 反推：唯一一个恰好接受这些参数名的工具。
+
+    先要求必填字段全齐；如果模型连必填也丢了，仍命名唯一能接受这些
+    参数的工具，让客户端报"缺字段"而不是"未知工具"。"""
+    for need_required in (True, False):
+        fits = []
+        for name, params in schemas.items():
+            props = set(params.get("properties") or {})
+            required = set(params.get("required") or [])
+            if set(args) <= props and (not need_required or required <= set(args)):
+                fits.append((len(props - set(args)), name))
+        fits.sort()
+        if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
+            return fits[0][1]
+    return None
+
+
+def _repair_tool_names(tools):
+    schemas = _tool_schemas()
+    if not schemas:
+        return tools
+    for t in tools:
+        if not isinstance(t, dict) or "function" not in t:
+            continue
+        fn = t["function"]
+        if fn.get("name") in schemas:
+            continue
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            continue
+        if isinstance(args, dict):
+            inferred = _infer_tool_name(args, schemas)
+            if inferred:
+                fn["name"] = inferred
+    return tools
+
+
+# [v77 PR#72 移植] 当前请求的推理档位（thinking 开启时），build_prompt 转成
+# 多思考指令。
+request_effort = contextvars.ContextVar("request_effort", default=None)
+
+
+def effort_level(body):
+    """[v77 PR#72 移植] 客户端的 effort 字符串，无论方言放在哪个字段。"""
+    cands = [body.get("reasoning_effort"), body.get("effort")]
+    for key in ("reasoning", "output_config", "thinking"):
+        v = body.get(key)
+        if isinstance(v, dict):
+            cands += [v.get("effort"), v.get("reasoning_effort"), v.get("level")]
+        elif key == "thinking" and isinstance(v, str):
+            cands.append(v)
+    for c in cands:
+        if isinstance(c, str) and c.strip():
+            return c.strip().lower()
+    return None
+
+
 def parse_tools(text):
-    text = _repair_bare_dsml_lines(text)
     tools = []
     clean_text = text
     fence_spans = _code_fence_spans(text)
@@ -1207,18 +1574,63 @@ def parse_tools(text):
                 p_name = pm.group(1).strip()
                 p_val = _clean_param_value(pm.group(2))
                 try:
-                    args[p_name] = json.loads(_repair_truncated_json(p_val, strict=True))
+                    val = json.loads(_repair_truncated_json(p_val, strict=True))
                 except Exception:
+                    val = p_val
+                # [v75-a] 外层包装名解包：模型模仿 <tool_call> 结构时会写
+                # parameter name="arguments" 把整个参数包起来，直接嵌套会产出
+                # {"arguments": {...}} 双层结构，执行器找不到必填参数整条拒收
+                # （生产实证 2026-10-25 18:24 会话 e1751fe3）。此处合并解包。
+                if p_name in _DSML_ARGS_WRAPPERS:
+                    if isinstance(val, dict):
+                        args.update(val)
+                        continue
+                    if isinstance(val, str):
+                        inner = None
+                        try:
+                            inner = json.loads(val)
+                        except Exception:
+                            # 尾部垃圾（模型多写的闭合括号等）：raw_decode 只取
+                            # 开头完整的 JSON 值，其余忽略；非 JSON 文本直接失败
+                            try:
+                                inner, _end = json.JSONDecoder().raw_decode(val.lstrip())
+                            except Exception:
+                                inner = None
+                        if isinstance(inner, dict):
+                            args.update(inner)
+                            continue
+                    args[p_name] = val
+                    continue
+                # [v75-b] 容器类型还原为字符串：工具参数均为字符串类型（模型
+                # 输出标注 string="true"）。JSON 文本（如 file_write 的
+                # content payload）必须保持文本，禁止 json.loads 把字符串变成
+                # 对象——客户端 file_write 只收字符串，会以"缺少 content"拒收
+                # （生产实证 2026-10-25 当天连拒 3 次）。标量仍正常转换。
+                # [v77 PR#70 移植] string="true" 标注 = 字面字符串："42"/"true"
+                # 不得变成 JSON。放在包装名解包之后——历史实证（v75 Fix 1）：
+                # 模型误用标注把 JSON 对象标成 string="true" 包在 arguments
+                # 包装里，守卫若在解包前生效会把双层嵌套放回去。
+                if re.search(r"string\s*=\s*[\x27\x22]true", pm.group(0), re.IGNORECASE):
                     args[p_name] = p_val
+                    continue
+                if isinstance(val, (dict, list)):
+                    val = p_val
+                args[p_name] = val
             tag_param_matches = re.finditer(r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in tag_param_matches:
                 t_name = pm.group(1).strip().lower()
                 if t_name in param_names:
                     t_val = _clean_param_value(pm.group(2))
-                    try:
-                        args[t_name] = json.loads(_repair_truncated_json(t_val, strict=True))
-                    except Exception:
-                        args[t_name] = t_val
+                    if re.search(r"string\s*=\s*[\x27\x22]true", tm.group(0), re.IGNORECASE):
+                        t_val_parsed = t_val
+                    else:
+                        try:
+                            t_val_parsed = json.loads(_repair_truncated_json(t_val, strict=True))
+                        except Exception:
+                            t_val_parsed = t_val
+                    if isinstance(t_val_parsed, (dict, list)):
+                        t_val_parsed = t_val
+                    args[t_name] = t_val_parsed
             if candidate_name:
                 norm = normalize_tool_call(candidate_name, args)
                 if norm:
@@ -1250,10 +1662,24 @@ def parse_tools(text):
             for pm in param_pattern_b.finditer(body):
                 p_name = pm.group(1).lower().strip()
                 p_val = _clean_param_value(pm.group(2))
-                try:
-                    args[p_name] = json.loads(_repair_truncated_json(p_val, strict=True))
-                except Exception:
+                if re.search(r"string\s*=\s*[\x27\x22]true", pm.group(0), re.IGNORECASE):
                     args[p_name] = p_val
+                    continue
+                try:
+                    val = json.loads(_repair_truncated_json(p_val, strict=True))
+                except Exception:
+                    val = p_val
+                # [v75-b] 同主分支：容器类型还原为字符串
+                # [v77 PR#70 移植] string="true" 标注 = 字面字符串："42"/"true"
+                # 不得变成 JSON。放在包装名解包之后——历史实证（v75 Fix 1）：
+                # 模型误用标注把 JSON 对象标成 string="true" 包在 arguments
+                # 包装里，守卫若在解包前生效会把双层嵌套放回去。
+                if re.search(r"string\s*=\s*[\x27\x22]true", pm.group(0), re.IGNORECASE):
+                    args[p_name] = p_val
+                    continue
+                if isinstance(val, (dict, list)):
+                    val = p_val
+                args[p_name] = val
             norm = normalize_tool_call(tool_name, args)
             if norm:
                 tools.append(norm)
@@ -1297,7 +1723,10 @@ def parse_tools(text):
             clean_text = re.sub(r"<function_call>.*?</function_call>", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools:
-        tag_regex = re.compile(r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>", re.IGNORECASE)
+        # [v76-a] 标签名补 call：模型会混用第三种写法 <call tool="名字">{...}</call>
+        # （生产实证 2026-10-26 会话 3e4457c5，shell_execute 调用整段泄露进正文）。
+        # 该路径本就支持 tool= 属性，只缺标签名。属性分支自动把 JSON 顶层键当参数。
+        tag_regex = re.compile(r"<(?:tool_call|function_call|call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>", re.IGNORECASE)
         decoder = json.JSONDecoder()
         matches = [m for m in tag_regex.finditer(text) if not hidden(m.start())]
         if matches:
@@ -1313,7 +1742,7 @@ def parse_tools(text):
                     except Exception:
                         pass
                     if not data:
-                        cleaned_json = re.sub(r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*", "", json_substr, flags=re.DOTALL).strip()
+                        cleaned_json = re.sub(r"</?(?:tool_call|function_call|tool_calls|invoke|call(?=[\s>/]))[^>]*>.*", "", json_substr, flags=re.DOTALL).strip()
                         open_b = cleaned_json.count("{")
                         close_b = cleaned_json.count("}")
                         if open_b > close_b:
@@ -1342,7 +1771,10 @@ def parse_tools(text):
                             norm = normalize_tool_call(name, args)
                             if norm:
                                 tools.append(norm)
-            clean_text = re.sub(r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)(?:\s*(?:参数|parameter|param)\s*>)?", "", text, flags=re.DOTALL).strip()
+            # [v76-a] call 后必须紧跟空白或 >（call(?=[\s>])）：防止 <call_call>
+            # 这类畸形标签被当作 <call> 开标签、DOTALL 吞掉后续正文
+            # （回放实证 1792866321_stream_ce93ffb8）。
+            clean_text = re.sub(r"<(?:tool_call|function_call|call(?=[\s>]))[^>]*>.*?(?:</(?:tool_call|function_call|call)>|$)(?:\s*(?:参数|parameter|param)\s*>)?", "", text, flags=re.DOTALL).strip()
 
     if not tools:
         codeblock_pattern = r"```(?:tool_call|function_call)\s*(.*?)\s*```"
@@ -1382,6 +1814,8 @@ def parse_tools(text):
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = _strip_wrapper_tags(clean_text).strip()
+    # [v77 PR#70 移植] 模型丢掉工具名时按请求的 tool schema 反推
+    tools = _repair_tool_names(tools)
     return tools, clean_text
 
 
@@ -2072,6 +2506,13 @@ def _scan_recent_sse_errors(parsed_events):
 
 
 def _raise_empty_sse_response(recent_lines, parsed_events):
+    # [v77 P0-4 移植] 信封内嵌请求关联 id（若中间件已注入），失败响应可与
+    # 访问日志行对上。延迟 import 避免依赖方向问题。
+    try:
+        from middleware import request_id_var
+        _rid = request_id_var.get() or "-"
+    except Exception:
+        _rid = "-"
     err = _scan_recent_sse_errors(parsed_events)
     if err:
         code, msg = err
@@ -2079,7 +2520,7 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        raise UpstreamError(code, msg)
+        raise UpstreamError(code, f"{msg} [rid:{_rid}]")
     if _sse_context_limit_hint(recent_lines, parsed_events):
         msg = _EMPTY_SSE_CONTEXT
     else:
@@ -2088,7 +2529,7 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
         "DeepSeek SSE ended without assistant output; last events: %s",
         recent_lines[-_SSE_RECENT_LINES:],
     )
-    raise UpstreamError(502, msg)
+    raise UpstreamError(502, f"{msg} [rid:{_rid}]")
 
 
 def _raise_sse_error_event(data, recent_lines):
@@ -2221,6 +2662,10 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
     got_output = False
     got_body = False
     finished = False
+    # [v77 PR#70 移植] DeepSeek 会以 status INCOMPLETE 结束被它截断的回复
+    # （长上下文思考中可见）。还没有任何回答文本时这是失败轮，不是完成轮：
+    # 空 "stop" 会让 agent 客户端误以为轮次正常结束。
+    incomplete = False
     # [v58] 累积非思考正文，供 FINISHED 时判断是否只剩未解析的工具标记
     body_acc = []
     # [v63] 首字节预算提前到 POST 之前定义（S8）：该预算的设计意图本就是
@@ -2251,7 +2696,7 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
         line_buf = b""
 
         async def _emit_from_event(data):
-            nonlocal think_open, got_output, got_body
+            nonlocal think_open, got_output, got_body, incomplete
             if isinstance(data, dict) and data.get("type") == "error":
                 _raise_sse_error_event(data, recent_lines)
 
@@ -2259,15 +2704,35 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
                 for op in data["v"]:
                     if not isinstance(op, dict):
                         continue
-                    if op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
+                    if op.get("p") == "quasi_status":
+                        # [v77 PR#70 移植] 状态词永不属于内容；INCOMPLETE 记账
+                        incomplete = incomplete or op.get("v") == "INCOMPLETE"
                         continue
                     async for chunk in _emit_from_event(op):
                         yield chunk
                 return
 
+            # [v77 PR#70 移植] 其他 status 字段（"response/status"、".../status"）
+            # 携带 INCOMPLETE / WIP 等状态词，永不属于内容。
+            _p_name, _p_val = str(data.get("p") or ""), data.get("v")
+            if (
+                _p_name.endswith("status")
+                and isinstance(_p_val, str)
+                and _p_val.isupper()
+                and _p_val != "FINISHED"
+            ):
+                incomplete = incomplete or _p_val == "INCOMPLETE"
+                return
+
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
                     yield "</think>"
+                # [v77 PR#70 移植适配] INCOMPLETE 且无任何回答 = 上游截断了
+                # 回复。抛中断走既有 auto-continue 续写恢复（比上游的 502 更
+                # 优：续写轮要求"继续"，模型从中断处接着产出）。
+                if incomplete and not got_body:
+                    logger.warning("[v77] FINISHED with status INCOMPLETE and no body -> continue")
+                    raise _SseStreamInterrupted()
                 if not got_output:
                     _raise_empty_sse_response(recent_lines, parsed_events)
                 # [v57 移植 v39] FINISHED with thinking only, no body: upstream
@@ -2449,6 +2914,10 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
 
         if think_open:
             yield "</think>"
+        # [v77 PR#70 移植适配] 流尾同样检查 INCOMPLETE
+        if incomplete and not got_body:
+            logger.warning("[v77] stream ended with status INCOMPLETE and no body -> continue")
+            raise _SseStreamInterrupted()
         if not got_output:
             _raise_empty_sse_response(recent_lines, parsed_events)
         if not finished:
@@ -2624,7 +3093,55 @@ class _VisibleTracker:
                 i = j + 8
 
 
+# [v77 PR#71 移植] DeepSeek 网页端每账号同时只能生成一条回复；第二个并发
+# 发送会报 "A message is being generated" / "Messages too frequent"。改为
+# 按账号排队发送。所有生成都走 send_message，因此覆盖全部调用方。
+_send_locks = {}
+
+
+def token_busy(auth_token):
+    """[v77 PR#71 移植] 该账号正在生成（其发送锁被持有）时为 True。"""
+    lock = _send_locks.get(auth_token)
+    return bool(lock and lock.locked())
+
+
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None, max_continue=2):
+    # [v77 PR#71 移植] 上游流由独立任务排空：即使消费方中途放弃这个
+    # generator（客户端消失且未 aclose），锁也会在 DeepSeek 结束时释放——
+    # 跨 yield 持锁会泄漏锁，把该账号之后的所有请求全部卡死。
+    lock = _send_locks.setdefault(auth_token, asyncio.Lock())
+    queue = asyncio.Queue()
+    done = object()
+
+    async def _pump():
+        try:
+            async with lock:
+                gen = _send_message_locked(chat_id, auth_token, message, parent_message_id, thinking=thinking, search=search, file_ids_=file_ids_, max_continue=max_continue)
+                try:
+                    async for chunk in gen:
+                        queue.put_nowait(chunk)
+                finally:
+                    await gen.aclose()
+        except Exception as e:
+            queue.put_nowait(e)
+        finally:
+            queue.put_nowait(done)
+
+    task = asyncio.create_task(_pump())
+    try:
+        while True:
+            item = await queue.get()
+            if item is done:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        # 消费方关闭我们（断连、abort）时仍取消上游。
+        task.cancel()
+
+
+async def _send_message_locked(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None, max_continue=2):
     """带自动续写的对外入口。
 
     上游流在 FINISHED 之前异常中断（断流/断连/上游提前关闭）时，自动以
