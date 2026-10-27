@@ -59,6 +59,12 @@ PROMPT_OVERHEAD_TOKENS = int(os.getenv("DEEPSEEKER_PROMPT_OVERHEAD_TOKENS", "409
 SESSION_ABS_CEIL = int(os.getenv("DEEPSEEKER_SESSION_ABS_CEIL", "0"))  # 0 = 跟随记忆门槛
 # Token budget for the model-generated handoff summary.
 MAX_SUMMARY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_TOKENS", "4096"))
+# [v77.4/A] 摘要输入封顶：独立于换本线。摘要请求是发给一次性草稿会话的
+# "首条"，走首条快速通道——金丝雀实测 53.9 万 token 单条全量保留
+# （2026-10-28）。封顶放宽到 53 万（预留指令开销 ~400），让"即将被官方
+# 遗忘的那段"（边界实测 ~57.4 万）在换本触发时能完整进摘要，而不是被
+# _cap_parts 静默丢弃。
+SUMMARY_INPUT_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_INPUT_TOKENS", "530000"))
 
 
 def context_window_tokens():
@@ -337,7 +343,9 @@ def _with_effort(prompt):
 def build_summary_request_prompt(messages):
     """Prompt that asks the model for the handoff summary of the conversation."""
     convo = _messages_plain_text(messages)
-    convo, _ = _cap_parts(convo.split("\n\n"), context_window_tokens())
+    # [v77.4/A] 封顶从换本线（49.6万）放宽到首条实测安全值 53 万：
+    # 超出换本线的最老部分不再被静默丢弃，而是进入摘要。
+    convo, _ = _cap_parts(convo.split("\n\n"), SUMMARY_INPUT_TOKENS)
     return (
         "[SYSTEM]\n" + SUMMARY_INSTRUCTION + "\n\n"
         "[CONVERSATION TO SUMMARIZE]\n" + "\n\n".join(convo) + "\n\n"
@@ -729,17 +737,31 @@ async def extract_user_msg(messages):
 
 
 def _trim_to_budget(text, max_tokens):
-    """Hard-trim text to fit a token budget, keeping the tail (newest content)."""
+    """Hard-trim text to fit a token budget, keeping the tail (newest content).
+
+    [v77.4] 旧实现按 "~4 chars/token" 的英文启发式起砍再对半折——对中文
+    密集文本（~1 字/token）一次就砍到目标的 ~50-60%（实测 53 万预算只
+    装下 31.8 万）。改为：用尾部 2 万字符的实测比值估初始切口，一般
+    1-2 次编码即收敛；不足时按比例回填一次。
+    """
     if count_tokens(text) <= max_tokens:
         return text
-    max_chars = max(max_tokens, 1) * 4  # ~4 chars/token estimate, then shrink
+    sample = text[-20000:]
+    ratio = max(count_tokens(sample) / max(len(sample), 1), 0.01)
+    max_chars = int(max_tokens / ratio)
     candidate = ""
     while max_chars > 0:
         candidate = text[-max_chars:].lstrip()
-        if count_tokens(candidate) <= max_tokens:
+        n = count_tokens(candidate)
+        if n <= max_tokens:
+            # 回填：余量超过 5% 时按实测比值放大一档
+            if n < max_tokens * 0.95 and max_chars < len(text):
+                grow = int(max_chars * max_tokens / max(n, 1))
+                cand2 = text[-min(grow, len(text)):].lstrip()
+                if count_tokens(cand2) <= max_tokens:
+                    return cand2
             return candidate
-        max_chars //= 2
-        candidate = ""
+        max_chars = int(max_chars * 0.9)
     # Only reachable for pathological inputs (a single token longer than the
     # budget); degrade to empty rather than return an over-budget string.
     return candidate
