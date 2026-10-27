@@ -174,6 +174,16 @@ def init_db():
         conn.execute(
             "ALTER TABLE chat_memory ADD COLUMN creation_total REAL NOT NULL DEFAULT 0"
         )
+    # [v77.5/B] 接力摘要：rolling_summary=累计续接笔记；rolling_marker=
+    # 已消化到的客户端历史 token 位置（与 digest 切片同一估算口径）。
+    if "rolling_summary" not in existing_cm_cols:
+        conn.execute(
+            "ALTER TABLE chat_memory ADD COLUMN rolling_summary TEXT NOT NULL DEFAULT ''"
+        )
+    if "rolling_marker" not in existing_cm_cols:
+        conn.execute(
+            "ALTER TABLE chat_memory ADD COLUMN rolling_marker REAL NOT NULL DEFAULT 0"
+        )
     if "consecutive_403" not in existing_cols:
         conn.execute(
             "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
@@ -1072,6 +1082,46 @@ def set_chat_baseline(session_id, baseline, creation_total=0):
             "ON CONFLICT(session_id) DO UPDATE SET baseline = excluded.baseline, "
             "creation_total = excluded.creation_total",
             (session_id, int(baseline or 0), time.time(), int(creation_total or 0)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_rolling_state(session_id):
+    """(rolling_summary, rolling_marker) — 本会话创建时交接下来的接力摘要。
+
+    rolling_summary：截至上一代换本的累计续接笔记（'' = 无，首次换本）。
+    rolling_marker：客户端历史已被摘要消化的 token 位置（摘要切片的左边界）。
+    旧行/缺行返回 ("", 0) —— 退化为"全量消化（原文尾巴除外）"，与 v77.4 等价。
+    """
+    if not session_id:
+        return "", 0
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT rolling_summary, rolling_marker FROM chat_memory WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return "", 0
+        return (row[0] or ""), float(row[1] or 0)
+    finally:
+        conn.close()
+
+
+def set_rolling_state(session_id, summary, marker):
+    """记录接力摘要与消化位置（保留行内 baseline/creation_total 记账）。"""
+    if not session_id:
+        return
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO chat_memory (session_id, baseline, created_at, creation_total,"
+            " rolling_summary, rolling_marker) VALUES (?, 0, ?, 0, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET rolling_summary = excluded.rolling_summary,"
+            " rolling_marker = excluded.rolling_marker",
+            (session_id, time.time(), summary or "", float(marker or 0)),
         )
         conn.commit()
     finally:

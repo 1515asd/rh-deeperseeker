@@ -177,6 +177,8 @@ from functions import (
     find_session,
     get_auth_token,
     get_chat_baseline,
+    get_rolling_state,
+    set_rolling_state,
     get_token,
     get_tokens,
     init_db,
@@ -256,6 +258,13 @@ from plugin_helper import (
     max_output_tokens,
     needs_rollover,
     strip_summary_tags,
+    build_rolling_digest_prompt,
+    compute_rollover_split,
+    chunk_messages,
+    render_history_tail,
+    messages_plain_text as _messages_plain_text,
+    ROLLOVER_TAIL_TOKENS,
+    DIGEST_CHUNK_TOKENS,
     MAX_HISTORY_TOKENS,
     MAX_SUMMARY_TOKENS,
     estimate_conversation_tokens_cached,
@@ -1016,6 +1025,7 @@ async def handle_chat(
                 parent_message_id = fresh["parent_message_id"]
 
         _rollover_baseline, _creation_total = await _db(get_chat_baseline, session_id)
+        _tail_text = None  # [v77.5/B] 换本时的最近原文尾巴（未换本则 None）
         # [v72] 定期重建：除了上下文超限，会话轮数超过阈值也触发同一套
         # rollover 流程（删映射→生成摘要→新上游会话→按客户端真实历史全量
         # 重打包，重建后首条路径自动带任务锚点+对账单）。动机：长会话中
@@ -1030,11 +1040,31 @@ async def handle_chat(
                 session_id,
             )
             await _db(delete_sessions_for_chat, token_id, session_id)
-            scratch_chat = await create_new_chat(tok["token"])
-            summary_gen = send_message(
-                scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
-            )
-            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+            # [v77.5/B] 接力摘要三件套：
+            #   1) 滚动摘要——只消化"上次消化点之后、原文尾巴之前"的增量，
+            #      旧内容由上一代摘要保住，代代相传，无天花板；
+            #   2) 最近原文——尾巴段原样进新会话首条，压缩损失不碰最新上下文；
+            #   3) 分段接力——切片超过 DIGEST_CHUNK_TOKENS 时按消息切块顺序
+            #      消化（每块 = 旧摘要 + 块文本 → 更新版摘要），永不硬吞。
+            _old_roll, _roll_marker = await _db(get_rolling_state, session_id)
+            _slice_msgs, _tail_msgs, _sizes, _total_now = compute_rollover_split(
+                messages, marker=_roll_marker, tail_budget=int(ROLLOVER_TAIL_TOKENS * 0.9))
+            rollover_summary = _old_roll
+            _chunks = chunk_messages(_slice_msgs, DIGEST_CHUNK_TOKENS)
+            for _ci, _chunk in enumerate(_chunks):
+                _ctext = _messages_plain_text(_chunk)
+                _dprompt = build_rolling_digest_prompt(rollover_summary, _ctext, has_old=bool(rollover_summary))
+                _sc = await create_new_chat(tok["token"])
+                _sgen = send_message(
+                    _sc, tok["token"], _dprompt, 0, False, False, []
+                )
+                rollover_summary = strip_summary_tags(await collect_response(_sgen))[: MAX_SUMMARY_TOKENS * 4]
+                logger.info(
+                    "Rollover digest chunk %d/%d: +%d tokens -> rolling summary %d tokens",
+                    _ci + 1, len(_chunks), count_tok(_ctext), count_tok(rollover_summary),
+                )
+            _new_marker = sum(_sizes[: len(messages) - len(_tail_msgs)])
+            _tail_text = render_history_tail(_tail_msgs, ROLLOVER_TAIL_TOKENS) if len(_tail_msgs) > 1 else ""
             session_id = await create_new_chat(tok["token"])
             await _db(save_session, sig, token_id, session_id, 0)
             # [v77.3] rollover 后记账：baseline=摘要版首条的实际 token（很小），
@@ -1043,6 +1073,8 @@ async def handle_chat(
             await _db(set_chat_baseline, session_id,
                       len(rollover_summary) // 3 + estimate_conversation_tokens_cached(messages[-1:]),
                       estimate_conversation_tokens_cached(messages))
+            # [v77.5/B] 滚动摘要记账：本代已消化到"尾巴起点"
+            await _db(set_rolling_state, session_id, rollover_summary, _new_marker)
             parent_message_id = 0
             # The rollover itself was serialized under the OLD chat's lock;
             # the send -> save section below must hold the FRESH chat's lock.
@@ -1100,7 +1132,9 @@ async def handle_chat(
             for fid in file_ids:
                 if fid not in ref_set:
                     await _db(record_file, fid, token_id)
-        prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
+        prompt = await build_prompt(messages, tools or [], model, is_first,
+                                    rollover_summary=rollover_summary,
+                                    rollover_tail_text=_tail_text)
         if json_mode:
             # [v73] JSON 模式：提示层强约束（第一层防线；第二层出口校验在交付前）
             prompt += (

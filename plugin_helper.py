@@ -65,6 +65,14 @@ MAX_SUMMARY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_TOKENS", "4096"))
 # 遗忘的那段"（边界实测 ~57.4 万）在换本触发时能完整进摘要，而不是被
 # _cap_parts 静默丢弃。
 SUMMARY_INPUT_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_INPUT_TOKENS", "530000"))
+# [v77.5/B] 接力摘要三件套的尺寸参数：
+# - ROLLOVER_TAIL_TOKENS：换本时"最近原文"保留的 token 预算（原样进新会话
+#   首条，压缩损失不碰它）。设 20 万：新会话首条 = 摘要几 K + 尾巴 20 万，
+#   远低于首条通道实测上限（53.9 万），prefill ~20 秒。
+# - DIGEST_CHUNK_TOKENS：单次消化切片的上限；超过则按消息切块顺序接力
+#   （每块 = 旧摘要 + 块文本 → 更新版摘要），永不硬吞。
+ROLLOVER_TAIL_TOKENS = int(os.getenv("DEEPSEEKER_ROLLOVER_TAIL_TOKENS", "200000"))
+DIGEST_CHUNK_TOKENS = int(os.getenv("DEEPSEEKER_DIGEST_CHUNK_TOKENS", "250000"))
 
 
 def context_window_tokens():
@@ -390,6 +398,107 @@ def build_summary_seed_prompt(summary, current_user_message=""):
     if current_user_message:
         prompt += f"[USER]\n{current_user_message}\n\n"
     return prompt
+
+
+def build_rolling_digest_prompt(old_summary, new_content, has_old=True):
+    """[v77.5/B] 接力摘要提示词：旧累计摘要 + 新切片 → 更新版续接笔记。
+
+    摘要的是"新增内容"（old_summary 已代代保住旧内容），合并时要求保留
+    旧摘要中仍然相关的硬信息（目标/决定/数字/路径）。
+    """
+    old_block = ""
+    if has_old and old_summary:
+        old_block = (
+            "[ACCUMULATED SUMMARY SO FAR]\n" + old_summary.strip() + "\n\n"
+            "（以上是此前对话的累计摘要，其中的关键信息必须继续保留。）\n\n"
+        )
+    return (
+        "[SYSTEM]\n" + SUMMARY_INSTRUCTION + "\n\n"
+        + old_block
+        + "[NEW CONVERSATION CONTENT TO ABSORB]\n" + new_content.strip() + "\n\n"
+        + "[UPDATED SUMMARY]"
+    )
+
+
+def messages_plain_text(messages):
+    """公开包装：对话的纯文本表示（摘要/切片的统一输入形态）。"""
+    return _messages_plain_text(messages)
+
+
+def compute_rollover_split(messages, marker=0.0, tail_budget=None):
+    """[v77.5/B] 把客户端历史切成（待消化切片, 原文尾巴）。
+
+    - tail：从最新消息向前累计不超过 tail_budget 的最近消息（0.9 安全系数
+      由调用方折算，防止渲染时被 _cap_parts 再裁造成缝隙）；
+    - slice：[已消化 marker, 尾巴起点) 之间的消息——接力摘要本次要消化的
+      增量；marker 定位用同一估算口径，跨过 marker 的第一条消息并入切片
+      （宁可多摘要，不可漏）；
+    - 返回 (slice_msgs, tail_msgs, per_msg_sizes, total_tokens)。
+    """
+    if tail_budget is None:
+        tail_budget = ROLLOVER_TAIL_TOKENS
+    plains = [_messages_plain_text([m]) for m in messages]
+    sizes = [count_tokens(p) for p in plains]
+    total = sum(sizes)
+    # 尾部：从尾部向前累计
+    tail_start = len(messages)
+    acc = 0
+    while tail_start > 0 and acc + sizes[tail_start - 1] <= tail_budget:
+        acc += sizes[tail_start - 1]
+        tail_start -= 1
+    # 切片起点：跨过 marker 的第一条消息
+    slice_start = len(messages)
+    acc2 = 0
+    for i, sz in enumerate(sizes):
+        if acc2 >= marker:
+            slice_start = i
+            break
+        acc2 += sz
+    else:
+        slice_start = len(messages)
+    if slice_start > tail_start:
+        slice_start = tail_start
+    return messages[slice_start:tail_start], messages[tail_start:], sizes, total
+
+
+def chunk_messages(msgs, chunk_tokens):
+    """[v77.5/B] 按消息边界把列表切成每块 ≤ chunk_tokens 的连续块。
+
+    单条消息超限（罕见）时自成一块——消化提示词走首条通道，可承受。
+    """
+    chunks, cur, cur_sz = [], [], 0
+    for m in msgs:
+        sz = count_tokens(_messages_plain_text([m]))
+        if cur and cur_sz + sz > chunk_tokens:
+            chunks.append(cur)
+            cur, cur_sz = [], 0
+        cur.append(m)
+        cur_sz += sz
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def render_history_tail(tail_msgs, cap_tokens):
+    """[v77.5/B] 渲染最近原文尾巴（新会话首条用），保尾裁头。
+
+    末条（最新用户消息）不在此渲染——build_prompt 的 [USER] 段单独呈现，
+    避免重复。assistant 的 tool_calls 渲染进正文（v65 串线根治语义），
+    tool/system 消息跳过（结果由 [TOOL RESULTS] 段呈现）。
+    """
+    parts = []
+    for msg in tail_msgs[:-1]:
+        role = msg.get("role", "unknown")
+        if role in ("system", "tool"):
+            continue
+        content = _render_msg_content(msg, is_assistant=(role == "assistant"))
+        if content:
+            parts.append(f"{role.upper()}: {content}")
+    if not parts:
+        return ""
+    parts, truncated = _cap_parts(parts, cap_tokens)
+    marker = "[... earlier conversation history truncated ...]\n" if truncated else ""
+    return marker + "\n".join(parts)
 
 
 def strip_summary_tags(text):
@@ -905,7 +1014,7 @@ async def generate_signature(messages, model, scope=""):
     return generate_signature_cached(messages, model, scope)
 
 
-async def build_prompt(messages, tools, model, is_first_message=False, rollover_summary=None):
+async def build_prompt(messages, tools, model, is_first_message=False, rollover_summary=None, rollover_tail_text=None):
     final_prompt = ""
     tools_extract = await extract_tools(tools)
     if is_first_message and (rollover_summary or needs_rollover(messages)):
@@ -917,6 +1026,9 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         final_prompt = await append_fresh_session_runtime(final_prompt, messages, tools_extract)
         if rollover_summary:
             final_prompt += build_summary_seed_prompt(rollover_summary)
+        # [v77.5/B] 最近原文尾巴：压缩损失不碰最新上下文
+        if rollover_tail_text:
+            final_prompt += "[PREVIOUS CONVERSATION HISTORY]\n" + rollover_tail_text + "\n\n"
         relevant_tool_results = await extract_tool_results(messages, latest_only=True)
         if relevant_tool_results:
             relevant_tool_results = _capped_text(relevant_tool_results, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
