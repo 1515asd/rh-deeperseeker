@@ -1070,8 +1070,11 @@ async def handle_chat(
             # [v77.3] rollover 后记账：baseline=摘要版首条的实际 token（很小），
             # creation_total=客户端全量（摘要代表全部旧历史）——增长从此处
             # 重新起算，旧历史不再被算成"增长"（风暴根源）。
+            # [v77.7] baseline 必须含尾巴重量：换本后的新首条 = 摘要 + 尾巴
+            # （ROLLOVER_TAIL_TOKENS）+ 最新消息。漏算尾巴会导致下次换本在
+            # "尾巴 + 阈值"时才触发——尾巴越大，中途静默遗忘越多。
             await _db(set_chat_baseline, session_id,
-                      len(rollover_summary) // 3 + estimate_conversation_tokens_cached(messages[-1:]),
+                      len(rollover_summary) // 3 + ROLLOVER_TAIL_TOKENS + estimate_conversation_tokens_cached(messages[-1:]),
                       estimate_conversation_tokens_cached(messages))
             # [v77.5/B] 滚动摘要记账：本代已消化到"尾巴起点"
             await _db(set_rolling_state, session_id, rollover_summary, _new_marker)
