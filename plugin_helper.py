@@ -491,6 +491,9 @@ def render_history_tail(tail_msgs, cap_tokens):
         role = msg.get("role", "unknown")
         if role in ("system", "tool"):
             continue
+        # [v77.8] 伪 user 工具结果不进历史尾巴（由 [TOOL RESULTS] 统一呈现）
+        if role == "user" and _pseudo_tool_result_info(msg):
+            continue
         content = _render_msg_content(msg, is_assistant=(role == "assistant"))
         if content:
             parts.append(f"{role.upper()}: {content}")
@@ -659,6 +662,44 @@ def _render_msg_content(msg, is_assistant=False):
     return "\n".join(parts)
 
 
+# [v77.8] 伪 user 工具结果识别：部分客户端不按 OpenAI 规范用 role=tool 回传
+# 结果，而是把结果文本塞进 role=user 消息。生产实证（2026-10-28 会话
+# bcda0272，flash 模型 20+ 轮重试风暴）：模型 think 自述 "The user's latest
+# turn is actually a tool result"——结果进了 [USER] 段、[TOOL RESULTS] 缺条目，
+# 模型判定"调用了 N 条、结果少一条 → 结果没送达"，无限重试同一操作。
+_PSEUDO_TOOL_RESULT_RE = re.compile(
+    r"^\s*(?:<tool_result\b[^>]*>|\[tool[_ ]result\]|tool[_ ]result\s*[:：])",
+    re.IGNORECASE,
+)
+
+
+def _pseudo_tool_result_info(msg):
+    """若 msg 是伪 user 工具结果，返回 (tool_call_id 或 '', 文本)；否则 None。
+
+    判定特征（保守，防误伤真实用户消息）：
+    1. 文本以 <tool_result…> / [Tool Result] / [tool_result] / Tool result: 开头
+    2. 文本内含 "tool_call_id" 字段（JSON 形态回传）
+    """
+    if msg.get("role") != "user":
+        return None
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        text = " ".join(
+            c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") == "text")
+    else:
+        text = str(content)
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if _PSEUDO_TOOL_RESULT_RE.match(stripped) or '"tool_call_id"' in stripped:
+        m = re.search(r'"tool_call_id"\s*:\s*"([^"]+)"', stripped)
+        if not m:
+            m = re.search(r"\btool_call_id\s*[:=：]\s*(call_[A-Za-z0-9]+)", stripped)
+        return (m.group(1) if m else "", stripped)
+    return None
+
+
 async def extract_tool_results(messages, latest_only=False):
     target_messages = messages
     if latest_only:
@@ -680,24 +721,33 @@ async def extract_tool_results(messages, latest_only=False):
             content = i.get("content", "")
             if isinstance(content, list):
                 content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
-            content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
-            block = f"Tool: {name} (Call ID: {call_id})"
-            hit = call_index.get(call_id)
-            title = ""
-            if hit:
-                cmd_name, cmd_args = hit
-                # [v70] 回显模型自己起的调用标题（tool_title）：自己起的名字
-                # 是最强的认领锚点——比 JSON 更不容易认错自己的调用。
-                if isinstance(cmd_args, dict):
-                    t = str(cmd_args.get("tool_title") or "").strip()
-                    if t:
-                        title = t[:40]
-                cmd_json = json.dumps({"arguments": cmd_args, "name": cmd_name}, sort_keys=True)
-                block += f"\nCommand: <tool_call>{cmd_json}</tool_call>"
-            if title:
-                block += f"\nTitle: 你将这次调用命名为「{title}」"
-            block += f"\nResult: {content}"
-            tools_final.append(block)
+        else:
+            # [v77.8] 伪 user 工具结果收编：客户端把结果塞进 user 消息时旧逻辑
+            # 完全收不到 → [TOOL RESULTS] 缺条目、结果凭空消失，模型判定"结果
+            # 没送达"并无限重试同一操作。收编后调用数与结果数重新对齐。
+            pseudo = _pseudo_tool_result_info(i)
+            if not pseudo:
+                continue
+            call_id, content = pseudo
+            name = "tool"
+        content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
+        block = f"Tool: {name} (Call ID: {call_id})"
+        hit = call_index.get(call_id)
+        title = ""
+        if hit:
+            cmd_name, cmd_args = hit
+            # [v70] 回显模型自己起的调用标题（tool_title）：自己起的名字
+            # 是最强的认领锚点——比 JSON 更不容易认错自己的调用。
+            if isinstance(cmd_args, dict):
+                t = str(cmd_args.get("tool_title") or "").strip()
+                if t:
+                    title = t[:40]
+            cmd_json = json.dumps({"arguments": cmd_args, "name": cmd_name}, sort_keys=True)
+            block += f"\nCommand: <tool_call>{cmd_json}</tool_call>"
+        if title:
+            block += f"\nTitle: 你将这次调用命名为「{title}」"
+        block += f"\nResult: {content}"
+        tools_final.append(block)
     if not tools_final:
         return None
     # [v69] 对账单：官方 API 里结果↔调用靠 tool_call_id 结构化绑定（查表）；
@@ -832,6 +882,12 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
 async def extract_user_msg(messages):
     for i in messages[::-1]:
         if i.get("role") == "user":
+            # [v77.8] 最新 user 消息实为工具结果（客户端未按 tool role 回传）：
+            # [USER] 段必须留空——结果已由 [TOOL RESULTS] 呈现，混进 [USER] 会被
+            # 模型误读成用户的新指令/新操作（生产实证：模型把结果当成"用户
+            # 取消了 rebuild"）。返回空而不是继续前翻，避免把旧指令当成最新输入。
+            if _pseudo_tool_result_info(i):
+                return ""
             content = i.get("content")
             if isinstance(content, str):
                 return content
@@ -1049,6 +1105,9 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
                 role = msg.get("role", "unknown")
                 if role in ("system", "tool"):
                     continue
+                # [v77.8] 伪 user 工具结果不进 HISTORY（由 [TOOL RESULTS] 统一呈现）
+                if role == "user" and _pseudo_tool_result_info(msg):
+                    continue
                 # [v65] 串线根治：assistant 的命令在 tool_calls 字段里，必须渲染进
                 # 历史；否则纯工具调用的 assistant 消息整条消失，[TOOL RESULTS] 里
                 # 的结果全部变成"来源不明"，模型只能猜对应关系——猜错即串线。
@@ -1088,7 +1147,9 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         # 用户指令永远结构化地留在每轮重放的消息列表里。对策：纯工具轮把
         # 用户最新的真实指令作为 [CURRENT TASK] 锚点放进 prompt 最前面。
         task_anchor = ""
-        if not any(m.get("role") == "user" for m in trailing_messages):
+        # [v77.8] 伪 user 工具结果不算"有用户消息"——否则 v71 任务锚点被伪结果
+        # 误关，且下面的 [USER] 段会把结果原文当用户输入呈现。
+        if not any(m.get("role") == "user" and not _pseudo_tool_result_info(m) for m in trailing_messages):
             user_msg = await extract_user_msg(messages)
             if user_msg:
                 task_anchor = "[CURRENT TASK]（你正在执行的用户最新指令；下方工具结果都是为它服务的，与历史结论无关）\n" + _trim_to_budget(user_msg.strip(), 600) + "\n\n"
@@ -1102,7 +1163,8 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
 
         trailing_user_parts = []
         for m in trailing_messages:
-            if m.get("role") == "user":
+            # [v77.8] 伪 user 工具结果不进 [USER] 段（已在 [TOOL RESULTS] 呈现）
+            if m.get("role") == "user" and not _pseudo_tool_result_info(m):
                 c = m.get("content", "")
                 if isinstance(c, str) and c:
                     trailing_user_parts.append(c)
