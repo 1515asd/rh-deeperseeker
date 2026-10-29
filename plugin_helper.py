@@ -882,12 +882,16 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
 async def extract_user_msg(messages):
     for i in messages[::-1]:
         if i.get("role") == "user":
-            # [v77.8] 最新 user 消息实为工具结果（客户端未按 tool role 回传）：
-            # [USER] 段必须留空——结果已由 [TOOL RESULTS] 呈现，混进 [USER] 会被
-            # 模型误读成用户的新指令/新操作（生产实证：模型把结果当成"用户
-            # 取消了 rebuild"）。返回空而不是继续前翻，避免把旧指令当成最新输入。
+            # [v77.8] 伪 user 工具结果跳过。
+            # [v77.9] 修正 v77.8 的回归：v77.8 在遇到伪结果时直接返回空——
+            # 但 v71 的 [CURRENT TASK] 任务锚点恰恰取自本函数，而锚点唯一
+            # 需要生效的场景（工具结果轮）里最新 user 就是伪结果 → 锚点被
+            # 清空 → 模型失去任务延续感，每轮把输入当"用户新请求"重新解读
+            # （生产取证 10-28 会话 4b7dd282/cf7fc0e0：think 全部以"用户
+            # 截图显示/用户反馈/The user wants"开头）。正确语义是跳过伪
+            # 结果继续前翻，返回最近的真实用户指令。
             if _pseudo_tool_result_info(i):
-                return ""
+                continue
             content = i.get("content")
             if isinstance(content, str):
                 return content
