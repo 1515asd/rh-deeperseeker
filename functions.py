@@ -1534,6 +1534,72 @@ _THINK_SPAN_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _DSML_ARGS_WRAPPERS = {"arguments", "args", "parameters", "params"}
 
 
+# [v77.10-b] 宽容 arguments 抢救：模型转义不一致时（生产实证 2026-10-29
+# 19:32 会话：开引号写 \" 闭引号裸 "，导致 json.loads 失败），解包分支
+# 会退回 {"arguments": "<坏JSON字符串>"} 双层结构 → 客户端找不到必填参数
+# 整条拒收（"missing required parameter(s): command"）。此扫描器逐键提取
+# 顶层 "key": value 对，值内裸引号按字面还原（正是模型本意），仅作
+# 严格解析与 raw_decode 均失败后的最后手段。
+_LENIENT_KV_HEAD_RE = re.compile(r"[\x27\x22]([A-Za-z0-9_\-]+)[\x27\x22]\s*:\s*")
+_LENIENT_VALUE_TAIL_WS = " \t\r\n"
+_LENIENT_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f"}
+
+
+def _lenient_json_object(s: str) -> dict:
+    """从残破 JSON 文本中宽容提取顶层字符串/数字键值对。提取不到任何
+    完整键值对时返回 {}（调用方继续走原兜底，不改变既有行为）。"""
+    out = {}
+    n = len(s)
+    for m in _LENIENT_KV_HEAD_RE.finditer(s):
+        key = m.group(1)
+        i = m.end()
+        if i >= n:
+            continue
+        if s[i] in "\x27\x22":
+            # 字符串值：读到后面跟（可选空白后）, 或 } 的引号为止；
+            # 中途的裸引号（后随其他字符）视为值内的字面引号
+            j = i + 1
+            buf = []
+            closed = False
+            while j < n:
+                ch = s[j]
+                if ch == "\\" and j + 1 < n:
+                    nxt = s[j + 1]
+                    buf.append(_LENIENT_ESCAPES.get(nxt, "\\" + nxt))
+                    j += 2
+                    continue
+                if ch in "\x27\x22":
+                    k = j + 1
+                    while k < n and s[k] in _LENIENT_VALUE_TAIL_WS:
+                        k += 1
+                    if k >= n or s[k] in ",}":
+                        closed = True
+                        break
+                    buf.append(ch)
+                    j += 1
+                    continue
+                buf.append(ch)
+                j += 1
+            if closed or (not closed and buf):
+                out[key] = "".join(buf)
+            continue
+        m2 = re.match(r"-?\d+(?:\.\d+)?|true|false|null", s[i:])
+        if m2:
+            v = m2.group(0)
+            if v[0] in "-0123456789":
+                try:
+                    out[key] = json.loads(v)
+                except Exception:
+                    pass
+            elif v == "true":
+                out[key] = True
+            elif v == "false":
+                out[key] = False
+            else:
+                out[key] = None
+    return out
+
+
 # [v77 PR#70 移植] 当前请求的工具列表，由 handle_chat 设置，供 parse_tools
 # 在模型丢掉工具名时按 schema 反推调用归属。
 request_tools = contextvars.ContextVar("request_tools", default=None)
@@ -1669,6 +1735,14 @@ def parse_tools(text):
                             except Exception:
                                 inner = None
                         if isinstance(inner, dict):
+                            args.update(inner)
+                            continue
+                        # [v77.10-b] 严格解析与 raw_decode 均失败（转义不一致等
+                        # 残破 JSON）：宽容提取顶层键值对，杜绝双层嵌套拒收
+                        # （生产实证 2026-10-29 19:32 shell_execute "missing
+                        # required parameter(s): command" 事故）。
+                        inner = _lenient_json_object(val)
+                        if inner:
                             args.update(inner)
                             continue
                     args[p_name] = val
@@ -2148,17 +2222,51 @@ class StreamToolParser:
         # 换行（2026-10-24 用户报告"调用工具正文就多出换行"的另
         # 一半；前一半是桥自加的前导 "\n"，已在 app.py splitter
         # 剥掉）。真 prose（非纯空白）不受影响，照常放行并清标志。
-        self._post_tool_ws = False
+        # [v77.10] 初始值改为 True：流开头的纯空白同样吞掉。生产实证
+        # 2026-10-29 会话 f33a197e：模型习惯在 </think> 与工具块之间
+        # 写 "\n\n"，工具块剥掉后这串空白就成了整轮正文——客户端把
+        # 一轮里十几个工具轮的正文拼起来，用户看到"思考后面一堆空格"
+        # （v59 只管了工具块之后，管不到开头与块间）。纯空白片段才吞，
+        # 带实际文字的片段（含段间换行）照常放行。
+        self._post_tool_ws = True
+        # [v77.11] 纯空白暂扣缓冲：空白片段先扣住不发，等看到下一个产出
+        # （真文本 / 工具块 / 流结束）再裁决。取代 v77.10 的"边界后 lstrip"，
+        # 消除其唯一代价（工具块后首段若带行首缩进会被误剥）——暂扣方案
+        # 下任何含实际字符的文本永不修改，空白只在边界处按
+        # "剥到最后一个换行为止"规整（其后空格/制表=有意缩进，保留）。
+        self._pending_ws = ""
 
     def _emit_text(self, results, text: str) -> None:
-        """追加正文；若上一个产出是工具调用且本文本纯空白，则吞掉。"""
+        """追加正文。[v77.11] 暂扣-裁决语义：
+        - 纯空白片段 → 暂扣（_pending_ws），不立即决定；
+        - 边界后（流开头/工具块刚发完）首个真文本 → 暂扣空白与其前导
+          空白合并，剥掉到最后一个换行为止的排版噪音，其后的空格/制表
+          原样保留（模型的有意缩进零损失）；
+        - 非边界的真文本 → 先原样放行暂扣空白（正常行文的段间换行），
+          再原样放行本文本——任何含实际字符的文本永不修改。"""
         cleaned = _strip_stray_markers(text)
         if not cleaned:
             return
-        if self._post_tool_ws and not cleaned.strip():
+        if not cleaned.strip():
+            self._pending_ws += cleaned
             return
+        if self._post_tool_ws:
+            self._post_tool_ws = False
+            combined = self._pending_ws + cleaned
+            self._pending_ws = ""
+            i = 0
+            n = len(combined)
+            while i < n and combined[i] in " \t\r\n":
+                i += 1
+            last_nl = combined.rfind("\n", 0, i)
+            out = combined[last_nl + 1:] if last_nl != -1 else combined
+            if out:
+                results.append({"text": out})
+            return
+        if self._pending_ws:
+            results.append({"text": self._pending_ws})
+            self._pending_ws = ""
         results.append({"text": cleaned})
-        self._post_tool_ws = False
 
     def feed(self, chunk):
         self.buffer += chunk
@@ -2214,7 +2322,9 @@ class StreamToolParser:
                 if m:
                     start = m.start()
                     if start > 0:
-                        self._emit_text(results, self.buffer[:start])
+                        # [v77.10] 工具块前的正文片段去尾部空白（模型在正文与
+                        # 工具块之间写的 "\n\n" 粘在片段尾部，剥块后成残留）
+                        self._emit_text(results, self.buffer[:start].rstrip())
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
                     self._end_re = re.compile(
@@ -2275,7 +2385,8 @@ class StreamToolParser:
                     start = m.start()
                     pre = repaired[:start]
                     if pre.strip():
-                        self._emit_text(out, pre)
+                        # [v77.10] 同 feed 路径：工具块前去尾部空白
+                        self._emit_text(out, pre.rstrip())
                     parsed, clean_tail = parse_tools(repaired[start:])
                     for item in parsed:
                         if _valid_tool_call(item):
