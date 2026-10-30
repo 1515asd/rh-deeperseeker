@@ -1,27 +1,22 @@
 FROM python:3.13-slim
 
-
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
 WORKDIR /app
-
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock README.md ./
-COPY requirements*.in requirements*.txt ./
-RUN uv sync --no-install-project    # deps only — no project wheel without source
-COPY . .
-RUN uv sync                          # install the project now that source exists
+# requirements-based project: this repository has no pyproject.toml/uv.lock,
+# so plain pip replaces the former `uv sync` steps.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
 # P0-8 (Day 17): the service runs as an unprivileged user. Only the durable
 # state directory (SQLite database, cookie backup, generated api_key.txt) is
-# writable; the code and the venv stay root-owned and read-only to the
-# process. A named volume mounted at /app/data inherits this ownership on
+# writable; the code and the site-packages stay root-owned and read-only to
+# the process. A named volume mounted at /app/data inherits this ownership on
 # first use, so the default run needs no manual ownership surgery.
 RUN useradd --uid 10001 --home-dir /app --no-create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /app/data \
@@ -32,18 +27,14 @@ RUN useradd --uid 10001 --home-dir /app --no-create-home --shell /usr/sbin/nolog
 
 EXPOSE 4000
 
-# P0-2 (Day 20): stamped by .github/workflows/release.yml so the startup log
-# states the exact commit the image was built from. Defaults keep local
-# builds honest ("-").
+# P0-2 (Day 20): stamped by release CI so the startup log states the exact
+# commit the image was built from. Defaults keep local builds honest ("-").
 ARG DEEPSEEKER_BUILD_COMMIT=-
 
 ENV DB_PATH=/app/data/deeperseeker.db
 ENV DEEPSEEKER_COOKIE_PATH=/app/data/aws_cookies_deepseek.json
 ENV HOST=0.0.0.0
 ENV DEEPSEEKER_BUILD_COMMIT=${DEEPSEEKER_BUILD_COMMIT}
-# uv installs the console script into /app/.venv/bin — without this the
-# CMD below never resolves ("exec: deeperseeker: not found").
-ENV PATH="/app/.venv/bin:${PATH}"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -sf http://localhost:4000/health || exit 1
 
@@ -59,4 +50,4 @@ USER appuser
 # If reverting to backup Playwright cookie generation, run under xvfb:
 # CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
 # might also need requirements-waf-backup edition
-CMD ["deeperseeker"]
+CMD ["python3", "app.py"]

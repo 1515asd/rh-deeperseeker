@@ -1,0 +1,22 @@
+# VCS / dev artifacts — keep out of the build context
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+.omo/
+
+# Secrets — compose injects .env at runtime via env_file, never bake it in
+.env
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Durable state — lives in the deeperseeker_data volume, not the image
+data/
+*.db
+*.db.bak
+*.db-wal
+*.db-shm
+aws_cookies_deepseek.json
+api_key.txt

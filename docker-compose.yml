@@ -3,7 +3,7 @@ services:
     build: .
     container_name: deeperseeker
     ports:
-      - "127.0.0.1:4000:4000"
+      - "0.0.0.0:4000:4000"
     environment:
       - HOST=0.0.0.0
       # P0-8: the image REFUSES to boot with the default admin/admin
