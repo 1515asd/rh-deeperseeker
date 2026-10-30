@@ -193,6 +193,9 @@ from functions import (
     request_tools as _request_tools,
     next_parent,
     parse_tools,
+    _salvage_tool_markup,
+    malformed_continue_count,
+    reset_malformed_continue_count,
     pick_token,
     warmup_pool,
     acquire_token_slot,
@@ -1033,7 +1036,18 @@ async def handle_chat(
         # ae65e2aa：数小时旧叙事淹没 30 秒前的金手指指令），且滑窗会无声
         # 丢失中段信息；定期重建等于定期把模型的世界观对齐到客户端账本。
         _rebuild_due = parent_message_id >= int(os.getenv("DEEPSEEKER_REBUILD_PARENT", "240"))
-        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline, tools=tools, creation_total=_creation_total) or _rebuild_due or _force_rollover):
+        # [v78] 畸形续写计数换血：上游会话记忆里积攒的模型自产坏样例改不到
+        # （我们重挂的是同一个上游会话），连续多轮 malformed 续写说明坏样例
+        # 已在自我繁殖——强制搬家到全新上游会话，摘要重建，坏样例不再回流。
+        _malformed_rollover = malformed_continue_count(session_id) >= int(
+            os.getenv("DEEPSEEKER_MALFORMED_ROLLOVER_THRESHOLD", "2"))
+        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline, tools=tools, creation_total=_creation_total) or _rebuild_due or _force_rollover or _malformed_rollover):
+            if _malformed_rollover:
+                logger.info(
+                    "Malformed-call rollover: chat %s hit %d malformed continuations; forcing fresh chat",
+                    str(session_id)[:8], malformed_continue_count(session_id),
+                )
+            reset_malformed_continue_count(session_id)
             logger.info(
                 "Context rollover: accumulated context over limit%s; purging session mappings for chat %s",
                 " (periodic rebuild: parent=%d)" % parent_message_id if _rebuild_due else "",
@@ -1217,6 +1231,11 @@ async def handle_chat(
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
         else:
             resp_text = await collect_response(gen)
+            # [v78] 缺开口/掉斜杠抢救：修复后再走解析/投递/展示全链路
+            _salvaged = _salvage_tool_markup(resp_text)
+            if _salvaged != resp_text:
+                logger.warning("[v78 salvage] 非流式正文修复畸形工具标记")
+                resp_text = _salvaged
             _dump_stream_debug(session_id, resp_text)
             await _db(mark_active, token_id)
 
@@ -1663,7 +1682,9 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         except Exception:
             pass
     finally:
-        parsed_tools, clean_text = parse_tools(full_text)
+        # [v78] 缺开口/掉斜杠抢救：修复后再解析，畸形块也能正常投递
+        # 工具调用，不再触发"纯标记无正文"的续写循环。
+        parsed_tools, clean_text = parse_tools(_salvage_tool_markup(full_text))
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
@@ -1811,7 +1832,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         except Exception:
             pass
     finally:
-        parsed_tools, clean_text = parse_tools(full_text)
+        # [v78] 缺开口/掉斜杠抢救：修复后再解析，畸形块也能正常投递
+        # 工具调用，不再触发"纯标记无正文"的续写循环。
+        parsed_tools, clean_text = parse_tools(_salvage_tool_markup(full_text))
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
         # B7: usage on the cleaned completion, not raw full_text. Computed

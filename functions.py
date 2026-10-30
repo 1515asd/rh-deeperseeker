@@ -1694,7 +1694,38 @@ def parse_tools(text):
     def hidden(pos):
         if any(s <= pos < e for s, e in fence_spans):
             return True
-        return any(s <= pos < e for s, e in think_spans)
+        if any(s <= pos < e for s, e in think_spans):
+            return True
+        # [v78-b] 行内代码（单反引号）里的标记是教学/示例引用，不是调用。
+        # 修复：行内 <tool_call> 提及被当开口与真调用配对，产出重复工具
+        # （2026-10-30 线上样本实测，v77.11 基线同病：1 次提及 + 1 个真
+        # 调用 → 2 个相同工具）。真实的工具调用从不写在单反引号里。
+        return any(s <= pos < e for s, e in inline_spans)
+
+    # [v78-b] 行内代码遮罩：等长 \x00 占位保证"在遮罩上找匹配、在原文上
+    # 删除"位置一致，用于块清除时防止正文从行内提及处被截断。不含行内
+    # 代码的文本行为逐字节不变。
+    inline_spans = [m.span() for m in re.finditer(r"`[^`\n]*`", text)]
+
+    def _sub_keep_inline(pattern, s, flags=0):
+        if not inline_spans:
+            return re.sub(pattern, "", s, flags=flags)
+        parts, last = [], 0
+        for a, b in inline_spans:
+            parts.append(s[last:a])
+            parts.append("\x00" * (b - a))
+            last = b
+        parts.append(s[last:])
+        masked = "".join(parts)
+        out, last, hit = [], 0, False
+        for m in re.finditer(pattern, masked, flags):
+            out.append(s[last:m.start()])
+            last = m.end()
+            hit = True
+        if not hit:
+            return s
+        out.append(s[last:])
+        return "".join(out)
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
     tool_matches = list(re.finditer(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
@@ -1783,8 +1814,8 @@ def parse_tools(text):
                     tools.append(norm)
 
     if tools:
-        clean_text = re.sub(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        clean_text = re.sub(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = _sub_keep_inline(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)>|$)", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = _sub_keep_inline(r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call)>|$)", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     # [v66] 精确格式优先：正文（think 区间外）存在 <tool_call>/<function_call>
     # 精确开标签时，绝不进 DSML 搜刮器。搜刮器最后的无 '<' 前缀搜索会把
@@ -1866,7 +1897,7 @@ def parse_tools(text):
             if norm:
                 tools.append(norm)
         if tools:
-            clean_text = re.sub(r"<function_call>.*?</function_call>", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+            clean_text = _sub_keep_inline(r"<function_call>.*?</function_call>", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools:
         # [v76-a] 标签名补 call：模型会混用第三种写法 <call tool="名字">{...}</call>
@@ -1920,7 +1951,7 @@ def parse_tools(text):
             # [v76-a] call 后必须紧跟空白或 >（call(?=[\s>])）：防止 <call_call>
             # 这类畸形标签被当作 <call> 开标签、DOTALL 吞掉后续正文
             # （回放实证 1792866321_stream_ce93ffb8）。
-            clean_text = re.sub(r"<(?:tool_call|function_call|call(?=[\s>]))[^>]*>.*?(?:</(?:tool_call|function_call|call)>|$)(?:\s*(?:参数|parameter|param)\s*>)?", "", text, flags=re.DOTALL).strip()
+            clean_text = _sub_keep_inline(r"<(?:tool_call|function_call|call(?=[\s>]))[^>]*>.*?(?:</(?:tool_call|function_call|call)>|$)(?:\s*(?:参数|parameter|param)\s*>)?", text, flags=re.DOTALL).strip()
 
     if not tools:
         codeblock_pattern = r"```(?:tool_call|function_call)\s*(.*?)\s*```"
@@ -1959,7 +1990,24 @@ def parse_tools(text):
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
-    clean_text = _strip_wrapper_tags(clean_text).strip()
+    # [v78-b] 行内代码先换成唯一哨兵再剥标签、剥完还原：防止
+    # _strip_wrapper_tags 把行内示例里的 `<tool_call>` 等标记从正文
+    # 里剥掉（2026-10-30 实测：教学正文提及变成空反引号）。哨兵含
+    # \x00，标签族正则永不匹配；被整块删除的提及还原时自然消失。
+    _sent = {}
+
+    def _protect_inline(m):
+        key = "\x00K%d\x00" % len(_sent)
+        _sent[key] = m.group(0)
+        return key
+
+    if inline_spans:
+        _protected = re.sub(r"`[^`\n]*`", _protect_inline, clean_text)
+        clean_text = _strip_wrapper_tags(_protected).strip()
+        for _k, _v in _sent.items():
+            clean_text = clean_text.replace(_k, _v)
+    else:
+        clean_text = _strip_wrapper_tags(clean_text).strip()
     # [v77 PR#70 移植] 模型丢掉工具名时按请求的 tool schema 反推
     tools = _repair_tool_names(tools)
     return tools, clean_text
@@ -2733,6 +2781,150 @@ def _raise_sse_error_event(data, recent_lines):
     raise UpstreamError(502, content)
 
 
+# ============================== [v78] 工具标记抢救 ==============================
+# 生产实证（2026-10-29 23:15 会话 cd859ddc，29.8 万 token 长会话）：模型在
+# 双格式摇摆中把 <｜｜DSML｜｜ invoke name="..."> 开口行整个丢掉——<calls>
+# 后直接跟 <parameter>，只剩孤儿 </invoke> 闭合。parse_tools 必须从开口行
+# 拿 name 才能解析 → 整块解析不出 → v58 按"纯标记无正文"中断 → 续写轮
+# 重犯同样形态（v62 诊断提示词附带的畸形原文反而成了坏样例）→ 重试用尽，
+# 客户端只收到兜底文案，回合零正文交付。
+#
+# 抢救两步（确定性字符串操作，仅 DSML 双竖线家族；think 区间与代码围栏内
+# 一律不碰，与 parse_tools 的 hidden 规则一致）：
+#   1. 掉斜杠闭合修复：`文本｜｜DSML｜｜ parameter>`（模型丢了 </）
+#      → `</｜｜DSML｜｜ parameter>`（2026-10-29 23:10/23:14 两轮
+#      tool_title 值尾携带残片的同族病灶；合法开口/闭合前必有 < 或 /，
+#      负向环视排除，不会误伤）。
+#   2. 缺 invoke 开口合成：calls 块内无任何 invoke 开口时，从实参推断
+#      工具名并补写开口行。名字来源按序：
+#      a) arguments JSON 里的 "name" 键（值须为本轮已声明工具名才认）；
+#      b) 本轮工具表中 required ⊆ 实参键集 的唯一工具（多候选不猜）。
+#      推断不出 → 原样返回，走既有 malformed 续写路径，绝不瞎猜。
+# 未发生任何修复时逐字节原样返回——对正常输出零改动、零代价。
+
+_SALVAGE_CLOSER_FIX_RE = re.compile(
+    r"(?<![</])"
+    r"[｜|]{2}\s*DSML\s*[｜|]{2}\s*(?:parameter|invoke|calls|tool_call)\s*>"
+)
+_SALVAGE_CALLS_BLOCK_RE = re.compile(
+    r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)[^>]*>"
+    r"(.*?)"
+    r"(?:</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:tool_calls?|calls)\s*>|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+_SALVAGE_INVOKE_OPEN_RE = re.compile(
+    r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call)\s+(?:name|tool)=[\x27\x22]",
+    re.IGNORECASE,
+)
+_SALVAGE_PARAM_RE = re.compile(
+    r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22]([^>]*)>"
+    r"(.*?)"
+    r"</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*parameter\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_SALVAGE_INVOKE_SYNTH = '\n<｜｜DSML｜｜ invoke name="%s">'
+
+
+def _salvage_tool_name_from_hint(args_keys, tools_hint):
+    """required ⊆ 实参键集 的唯一工具名；唯一才认，多候选/零候选都不猜。"""
+    if not tools_hint:
+        return None
+    cands = []
+    for t in tools_hint:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or t
+        name = fn.get("name")
+        if not name:
+            continue
+        req = ((fn.get("parameters") or {}).get("required")) or []
+        if req and set(req) <= set(args_keys):
+            cands.append(name)
+    return cands[0] if len(cands) == 1 else None
+
+
+def _salvage_tool_markup(text, tools_hint=None):
+    """[v78] 修复模型写坏的 DSML 工具块（掉斜杠闭合 + 缺 invoke 开口）。
+
+    返回修复后的文本；无法修复的块原样保留（交由既有 malformed 判定）。
+    未发生任何修复时返回值与入参逐字节相同。tools_hint 为本轮 OpenAI
+    工具表（缺省读 request_tools ContextVar）。"""
+    if not text or "DSML" not in text:
+        return text
+    fence_spans = _code_fence_spans(text)
+    # [v78] 行内代码（单反引号）里的 DSML 是教学示例，不是坏块——
+    # 与 _has_unswallowed_tool_markup 的行内豁免同一实证（edac56c5）。
+    fence_spans += [m.span() for m in re.finditer(r"`[^`\n]*`", text)]
+    think_spans = [m.span() for m in _THINK_SPAN_RE.finditer(text)]
+
+    def hidden(pos):
+        return any(s <= pos < e for s, e in fence_spans) or any(
+            s <= pos < e for s, e in think_spans
+        )
+
+    if tools_hint is None:
+        tools_hint = request_tools.get()
+
+    out_parts = []
+    last = 0
+    repaired = 0
+    for cm in _SALVAGE_CALLS_BLOCK_RE.finditer(text):
+        if hidden(cm.start()):
+            continue
+        block = cm.group(1)
+        fixed_block = _SALVAGE_CLOSER_FIX_RE.sub(lambda m: "</" + m.group(0), block)
+        if not _SALVAGE_INVOKE_OPEN_RE.search(fixed_block):
+            p_matches = list(_SALVAGE_PARAM_RE.finditer(fixed_block))
+            if p_matches:
+                args = {}
+                wrapped_raw = None
+                for pm in p_matches:
+                    p_name = pm.group(1).strip()
+                    p_val = _clean_param_value(pm.group(3))
+                    if p_name in _DSML_ARGS_WRAPPERS:
+                        wrapped_raw = p_val
+                        continue
+                    args[p_name] = p_val
+                cand = None
+                if wrapped_raw is not None:
+                    inner = None
+                    try:
+                        inner = json.loads(_repair_truncated_json(wrapped_raw, strict=True))
+                    except Exception:
+                        try:
+                            inner, _end = json.JSONDecoder().raw_decode(wrapped_raw.lstrip())
+                        except Exception:
+                            inner = None
+                    if not isinstance(inner, dict):
+                        inner = _lenient_json_object(wrapped_raw)
+                    if isinstance(inner, dict):
+                        maybe_name = inner.pop("name", None)
+                        args.update(inner)
+                        if isinstance(maybe_name, str) and maybe_name.strip():
+                            hint_names = {
+                                ((t.get("function") or t) or {}).get("name")
+                                for t in (tools_hint or [])
+                                if isinstance(t, dict)
+                            }
+                            if not hint_names or maybe_name in hint_names:
+                                cand = maybe_name.strip()
+                if not cand:
+                    cand = _salvage_tool_name_from_hint(args.keys(), tools_hint)
+                if cand:
+                    fixed_block = (_SALVAGE_INVOKE_SYNTH % cand) + fixed_block
+                    repaired += 1
+        if fixed_block != block:
+            repaired += 1
+            out_parts.append(text[last:cm.start(1)])
+            out_parts.append(fixed_block)
+            last = cm.end(1)
+    if not repaired:
+        return text
+    logger.warning("[v78 salvage] 修复 %d 处畸形工具标记（掉斜杠闭合/缺 invoke 开口）", repaired)
+    out_parts.append(text[last:])
+    return "".join(out_parts)
+
+
 # [v60] 工具调用标记的结构化特征（原生 tool_call/function_call 家族 +
 # DSML 装饰家族）。只匹配标签/装饰结构，不匹配散文里提到的 "DSML"
 # 字样，避免把正常讨论误判成调用。用于识别「parser 把畸形调用整块吞掉」
@@ -2760,10 +2952,17 @@ def _has_unswallowed_tool_markup(text: str) -> bool:
     工具的正常回合不算（工具走正常投递路径，由下游执行或按 schema 拒绝
     ——拒绝会带错误信息回给模型，模型能自纠，那是 v58 之前就设计好的
     容错路径）。
+
+    [v78] 行内代码（单反引号）里的标记也不算。2026-10-30 16:51 线上
+    实例（session edac56c5）：模型应拟请求在教学正文里用行内代码写了
+    一处 ` <tool_call> ` 字样，围栏豁免覆盖不到行内代码，整轮被判
+    畸形、连续打断续写 2 次，最终答案被降级重写。真实的工具调用从不
+    会写在单反引号里，豁免零风险。
     """
     if not text:
         return False
     spans = _code_fence_spans(text)
+    spans += [m.span() for m in re.finditer(r"`[^`\n]*`", text)]
     think_spans = [m.span() for m in _THINK_SPAN_RE.finditer(text)]
     hit = False
     for m in _TOOL_MARKUP_HINT_RE.finditer(text):
@@ -2937,6 +3136,12 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
                 # 思考、正文全空，用户被迫手动发「继续」。此处让既有自动续写
                 # 接管，重新请求上游产出真正回复（续写轮仍带 thinking）。
                 body_text = "".join(body_acc)
+                # [v78] 缺开口/掉斜杠抢救：能确定性修复的畸形块直接修好，
+                # 不再按 malformed 中断续写（续写轮会重犯且多花一整轮上游
+                # 往返）。修不好时保持原样，走既有 malformed 路径。
+                _salvaged_body = _salvage_tool_markup(body_text)
+                if _salvaged_body != body_text:
+                    body_text = _salvaged_body
                 if not _body_has_real_content(body_text):
                     logger.warning("[auto-continue] FINISHED but body is unparsed tool markup only -> continue")
                     # [v62] 分叉：因畸形工具调用触发时，把原始调用文本带进
@@ -3141,18 +3346,46 @@ _CONTINUE_PROMPT_EMPTY = (
 # 本提示词服务"工具调用格式错误被静默吞掉"（2026-10-24 12:27 线上实例
 # session bb59b5d3：模型输出一句正文 + 缺 name 的原生调用，parser 吞块、
 # parse_tools 解析不出、finish_reason=stop，会话死掉）。
-# 措辞刻意不指死具体病因（畸形不止缺 name 一种：还有只有闭合、参数块破损），
-# 统一说"格式错误"，附原始调用让模型自己定位，给格式示例降低再错率，
-# 并明确两条出路防止它只会"写正文总结"。
+# [v78] 改版：不再把畸形调用原文附进提示词——长会话里原文反而成了坏
+# 样例，模型照抄自己刚犯的错（2026-10-29 23:15 会话 cd859ddc 连续三轮
+# 重犯同一"缺 invoke 开口"形态的实证）。改为只描述常见病因与正确格式；
+# 原文仍由调用点写入服务端日志，运维可见性不受损。
 _MALFORMED_TOOL_PROMPT = (
     "【系统通知】你上一轮发出的工具调用格式错误，服务端无法解析，已拒绝执行。"
-    "被拒绝的原始调用如下：\n\n"
-    "<rejected_call>\n{raw}\n</rejected_call>\n\n"
+    "错误位置：你上一条消息里的那次工具调用，即紧挨本通知之前的最后一段输出。\n"
+    "常见病因：工具调用块缺少 <invoke name=\"工具名\"> 开口行，或闭合标签"
+    "丢了 </ 中的斜杠，或 name / arguments 字段缺失。\n"
     "工具调用的正确格式为（name 与 arguments 两个字段都不可缺少）：\n"
-    "<tool_call>{{\"name\": \"工具名\", \"arguments\": {{...}}}}</tool_call>\n\n"
+    "<tool_call>{\"name\": \"工具名\", \"arguments\": {...}}</tool_call>\n\n"
     "请重新发出格式正确的工具调用；如果这个任务已不需要工具，"
     "直接给出最终答案，不要复述上文，不要解释这个错误。"
 )
+
+# [v78-c] 递进披露：只有"再错就没有下一次"的最后一次续写才附上原文，
+# 供模型精确对照定位。此前各次绝不附原文（防坏样例模仿，2026-10-29
+# cd859ddc 三连犯实证）。最后一次附原文的风险可控：若这次仍失败，
+# 紧随其后的强制换血会把污染随旧会话整体丢弃；若这次成功，错误已被
+# 交付链消化，残留样例由换血阈值与抢救层继续兜底。
+_MALFORMED_TOOL_FINAL_SUFFIX = (
+    "\n\n【最后一次重试】以下是你上一条消息中写坏的调用原文，仅供对照定位"
+    "错误所在，切勿模仿其中的错误格式：\n"
+    "<rejected_call>\n{raw}\n</rejected_call>"
+)
+
+# [v78] 畸形续写计数（按上游 chat 记账）：send_message 每次因
+# malformed_tool_call 续写时 +1；干净收尾（FINISHED 且有可见正文）时清零。
+# app.handle_chat 在同会话计数达到阈值时强制换血（rollover 到全新上游
+# 会话）——上游会话记忆里积攒的模型自产坏样例我们改不到，唯一根治手段
+# 就是让会话搬家，自带摘要重建，坏样例不再回流。
+_MALFORMED_CONTINUE_COUNT = {}
+
+
+def malformed_continue_count(chat_id):
+    return _MALFORMED_CONTINUE_COUNT.get(chat_id, 0)
+
+
+def reset_malformed_continue_count(chat_id):
+    _MALFORMED_CONTINUE_COUNT.pop(chat_id, None)
 
 
 def _extract_malformed_call(text: str, limit: int = 400) -> str:
@@ -3389,6 +3622,9 @@ async def _send_message_locked(chat_id, auth_token, message, parent_message_id, 
         if clean_end:
             asyncio.create_task(_prefetch_pow(auth_token, "/api/v0/chat/completion"))
             if visible.seen:
+                # [v78] 干净收尾（FINISHED 且有可见正文）：畸形续写计数清零，
+                # 会话视为恢复健康，不触发换血。
+                reset_malformed_continue_count(chat_id)
                 return  # 正常完成（上游发出 FINISHED）
             # [v64] 收尾安全网：整个回合没有发出过任何可见正文——续写轮
             # 只吐了 【END】 被过滤器整段砍光（或反复只吐思考）。不能
@@ -3419,7 +3655,18 @@ async def _send_message_locked(chat_id, auth_token, message, parent_message_id, 
         # 【END】 被砍光 -> 静默死回合。换用禁终止标记的
         # _CONTINUE_PROMPT_EMPTY。已有可见正文时行为与 v62 完全一致。
         if interrupt_reason == "malformed_tool_call":
-            msg = _MALFORMED_TOOL_PROMPT.format(raw=interrupt_detail[:400])
+            # [v78] 计数 + 不再回贴原文（原文只进日志；连续犯错的会话由
+            # app 层按 _MALFORMED_CONTINUE_COUNT 强制换血）。
+            _MALFORMED_CONTINUE_COUNT[chat_id] = _MALFORMED_CONTINUE_COUNT.get(chat_id, 0) + 1
+            logger.warning(
+                "[v78] 畸形工具调用原文（仅日志，chat=%s 累计 %d 次）：%.400s",
+                str(chat_id)[:8], _MALFORMED_CONTINUE_COUNT[chat_id], interrupt_detail,
+            )
+            msg = _MALFORMED_TOOL_PROMPT
+            if attempt >= max_continue - 1:
+                # [v78-c] 递进披露：本次是最后一次续写（再错即达上限收尾
+                # 并触发换血），附上原文帮模型精确定位。
+                msg += _MALFORMED_TOOL_FINAL_SUFFIX.format(raw=interrupt_detail[:400])
         elif interrupt_reason == "empty_continuation" or not visible.seen:
             msg = _CONTINUE_PROMPT_EMPTY
         else:
