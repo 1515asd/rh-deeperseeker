@@ -1,8 +1,7 @@
-wasmtime
-aiohttp
-uvicorn
 fastapi
-python-multipart
-jinja2
-deepseek-tokenizer
+uvicorn
+aiohttp
 python-dotenv
+deepseek-tokenizer
+wasmtime
+jinja2
