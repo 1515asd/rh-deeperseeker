@@ -2829,7 +2829,7 @@ def _scan_recent_sse_errors(parsed_events):
     return None
 
 
-def _raise_empty_sse_response(recent_lines, parsed_events):
+def _raise_empty_sse_response(recent_lines, parsed_events, resp_ct="", non_sse_tail=None):
     # [v77 P0-4 移植] 信封内嵌请求关联 id（若中间件已注入），失败响应可与
     # 访问日志行对上。延迟 import 避免依赖方向问题。
     try:
@@ -2849,8 +2849,12 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
         msg = _EMPTY_SSE_CONTEXT
     else:
         msg = _EMPTY_SSE_DEFAULT
+    # [v82 诊断] 空流时记录响应类型与非流式原文（区分 WAF HTML / 业务
+    # JSON / 真·空 SSE——2026-10-31 晚协议变更排查）
+    _tail_txt = " | ".join((non_sse_tail or [])[-3:])[:400]
     logger.warning(
-        "DeepSeek SSE ended without assistant output; last events: %s",
+        "DeepSeek SSE ended without assistant output; ct=%s non_sse=%s; last events: %s",
+        resp_ct or "-", _tail_txt or "-",
         recent_lines[-_SSE_RECENT_LINES:],
     )
     raise UpstreamError(502, f"{msg} [rid:{_rid}]")
@@ -3213,9 +3217,11 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
         # consumed one — refill in the background for the next turn
         asyncio.create_task(_prefetch_pow(auth_token, "/api/v0/chat/completion"))
     headers = get_headers(auth_token, _pow)
+    # [v82] DeepSeek 2026-10-31 晚协议变更：parent_message_id 不再接受
+    # 0（biz_code 26 "invalid message id"）。实测不同接入点对 null 的
+    # 宽容度不一致——彻底不发该键（首条消息）是唯一全节点安全的写法。
     json_data = {
         "chat_session_id": chat_id,
-        "parent_message_id": parent_message_id,
         "model_type": DEFAULT_MODEL_TYPE,
         "prompt": message,
         "ref_file_ids": file_ids,
@@ -3224,7 +3230,11 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
         "preempt": False,
         "action": None,
     }
+    if parent_message_id:
+        json_data["parent_message_id"] = parent_message_id
 
+    _resp_ct = ""
+    non_sse_tail = []  # [v82 诊断] 非 data: 行的原文尾巴
     think_open = False
     got_output = False
     got_body = False
@@ -3253,6 +3263,7 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
         # cookies=cookie,  # Backup WAF fallback
     )
     async with resp:
+        _resp_ct = resp.headers.get("content-type", "")
         if resp.status != 200:
             error_text = await resp.text()
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
@@ -3301,7 +3312,7 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
                     logger.warning("[v77] FINISHED with status INCOMPLETE and no body -> continue")
                     raise _SseStreamInterrupted()
                 if not got_output:
-                    _raise_empty_sse_response(recent_lines, parsed_events)
+                    _raise_empty_sse_response(recent_lines, parsed_events, _resp_ct, non_sse_tail)
                 # [v57 移植 v39] FINISHED with thinking only, no body: upstream
                 # closed the turn without ever producing an answer. Treat as
                 # interrupted so the auto-continue path asks for the real reply.
@@ -3393,6 +3404,9 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
 
         async def _consume_sse_line(decoded_line: str):
             if not decoded_line.startswith("data: "):
+                if decoded_line:
+                    non_sse_tail.append(decoded_line[:200])
+                    del non_sse_tail[:-5]
                 return
             _remember_sse_line(recent_lines, decoded_line)
             try:
@@ -3492,7 +3506,7 @@ async def _send_message_once(chat_id, auth_token, message, parent_message_id, th
             logger.warning("[v77] stream ended with status INCOMPLETE and no body -> continue")
             raise _SseStreamInterrupted()
         if not got_output:
-            _raise_empty_sse_response(recent_lines, parsed_events)
+            _raise_empty_sse_response(recent_lines, parsed_events, _resp_ct, non_sse_tail)
         if not finished:
             # [v57 移植 v43] FINISHED 是"正常说完"的唯一凭证。没收到就说明流被
             # 上游/网络掐断，哪怕已经出过正文也可能断在半句——按中断处理触发
