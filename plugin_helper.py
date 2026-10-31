@@ -365,7 +365,9 @@ TOOL_USE_INSTRUCTIONS = (
     "TOOL USE INSTRUCTIONS:\n"
     "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
     "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
-    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
+    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool.\n"
+    "[v80] Format discipline: produce the complete single-line tool_call exactly as shown above, or no markup at all. "
+    "If you are unsure of the exact format, respond in plain text instead — never emit partial or improvised tool-call fragments."
 )
 
 

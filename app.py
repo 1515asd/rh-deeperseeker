@@ -196,6 +196,9 @@ from functions import (
     _salvage_tool_markup,
     malformed_continue_count,
     reset_malformed_continue_count,
+    empty_stream_count,
+    bump_empty_stream_count,
+    reset_empty_stream_count,
     pick_token,
     warmup_pool,
     acquire_token_slot,
@@ -206,6 +209,7 @@ from functions import (
     send_message,
     close_session,
     StreamToolParser,
+    _LeakGate,
     upload_file,
     get_file_content,
     _RetryBoundary,
@@ -1041,13 +1045,22 @@ async def handle_chat(
         # 已在自我繁殖——强制搬家到全新上游会话，摘要重建，坏样例不再回流。
         _malformed_rollover = malformed_continue_count(session_id) >= int(
             os.getenv("DEEPSEEKER_MALFORMED_ROLLOVER_THRESHOLD", "2"))
-        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline, tools=tools, creation_total=_creation_total) or _rebuild_due or _force_rollover or _malformed_rollover):
-            if _malformed_rollover:
+        # [v79] 空流兜底换血：连续多轮"流正常结束但零输出"（悬空轮）说明该
+        # 上游会话已进入不可自愈的坏状态——悬空轮留在上游记忆里让后续上下文
+        # 断裂（失忆），且我们无法向悬空轮回填内容。与畸形计数同一机制：
+        # 下一轮入口判定达标即搬家重建摘要，坏状态不回流。单次空轮视为瞬时
+        # 抖动不搬家（阈值 2 起效），可用
+        # DEEPSEEKER_EMPTY_STREAM_ROLLOVER_THRESHOLD 调节。
+        _empty_rollover = empty_stream_count(session_id) >= int(
+            os.getenv("DEEPSEEKER_EMPTY_STREAM_ROLLOVER_THRESHOLD", "2"))
+        if parent_message_id != 0 and (needs_rollover(messages, _rollover_baseline, tools=tools, creation_total=_creation_total) or _rebuild_due or _force_rollover or _malformed_rollover or _empty_rollover):
+            if _empty_rollover:
                 logger.info(
-                    "Malformed-call rollover: chat %s hit %d malformed continuations; forcing fresh chat",
-                    str(session_id)[:8], malformed_continue_count(session_id),
+                    "Empty-stream rollover: chat %s hit %d empty completions; forcing fresh chat",
+                    str(session_id)[:8], empty_stream_count(session_id),
                 )
             reset_malformed_continue_count(session_id)
+            reset_empty_stream_count(session_id)
             logger.info(
                 "Context rollover: accumulated context over limit%s; purging session mappings for chat %s",
                 " (periodic rebuild: parent=%d)" % parent_message_id if _rebuild_due else "",
@@ -1231,6 +1244,18 @@ async def handle_chat(
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
         else:
             resp_text = await collect_response(gen)
+            # [v79] 空流兜底：上游流正常结束但零可见输出 = 悬空轮（映射仍
+            # 保存在本会话，上游记忆里留下"用户消息发出后模型零回复"的断点）。
+            # 计入空回合计数，连续达标时下一轮 handle_chat 入口强制换血
+            # （见 _empty_rollover）。有输出的正常回合清零计数。
+            if resp_text.strip():
+                reset_empty_stream_count(session_id)
+            else:
+                _empty_n = bump_empty_stream_count(session_id)
+                logger.warning(
+                    "[v79 empty-stream] chat %s completed with ZERO visible output (streak %d); empty completion returned to client",
+                    str(session_id)[:8], _empty_n,
+                )
             # [v78] 缺开口/掉斜杠抢救：修复后再走解析/投递/展示全链路
             _salvaged = _salvage_tool_markup(resp_text)
             if _salvaged != resp_text:
@@ -1606,6 +1631,8 @@ async def _pseudo_stream(result: dict, model: str):
 
 async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope=""):
     parser = StreamToolParser()
+    # [v81] 泄露闸门：解析器认不出的畸形工具标记不再以正文流出
+    gate = _LeakGate()
     # One completion = one id/created: every SSE chunk of a stream must share
     # the same id + created so clients and gateways (New API, sub2api) can
     # reassemble and bill it as a single completion. Generated once here and
@@ -1640,7 +1667,8 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 else:
                     for r in parser.feed(text):
                         if "text" in r:
-                            yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
+                            for piece in gate.feed(r["text"]):
+                                yield f"data: {json.dumps(_chat_chunk([_choice({'content': piece})], cid=cid, created=created, model=model))}\n\n"
         for kind, text in splitter.flush():
             if not text:
                 continue
@@ -1649,8 +1677,28 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             else:
                 for r in parser.feed(text):
                     if "text" in r:
-                        yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
+                        for piece in gate.feed(r["text"]):
+                            yield f"data: {json.dumps(_chat_chunk([_choice({'content': piece})], cid=cid, created=created, model=model))}\n\n"
+        # [v81] 流结束裁决：暂扣区放行围栏内内容、丢弃围栏外标记残渣
+        for piece in gate.flush():
+            yield f"data: {json.dumps(_chat_chunk([_choice({'content': piece})], cid=cid, created=created, model=model))}\n\n"
+        if gate.dropped:
+            logger.warning("[v81 leak-gate] chat %s: dropped %d chars of unparsed tool markup from visible content", str(session_id)[:8], gate.dropped)
         _dump_stream_debug(session_id, full_text)
+        # [v79] 空流兜底：走到这里 = 流正常结束（客户端取消/上游异常都走
+        # 下方 except，不会到达）。full_text 为空 = 上游零输出悬空轮，计入
+        # 空回合计数，连续达标时下一轮入口强制换血（见 _empty_rollover）；
+        # 有输出的正常回合清零。注：此处 save_session 仍会保存映射（悬空轮
+        # 的映射保留是既有行为，客户端重试同 sig 可重放），换血判定在下一
+        # 轮入口统一处理，不在此处打断响应。
+        if full_text.strip():
+            reset_empty_stream_count(session_id)
+        else:
+            _empty_n = bump_empty_stream_count(session_id)
+            logger.warning(
+                "[v79 empty-stream] chat %s stream finished with ZERO upstream output (streak %d); empty completion returned to client",
+                str(session_id)[:8], _empty_n,
+            )
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
@@ -1714,7 +1762,10 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 if not parsed_tools:
                     for r in parser.flush():
                         if "text" in r:
-                            yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
+                            for piece in gate.feed(r["text"]):
+                                yield f"data: {json.dumps(_chat_chunk([_choice({'content': piece})], cid=cid, created=created, model=model))}\n\n"
+                    for piece in gate.flush():
+                        yield f"data: {json.dumps(_chat_chunk([_choice({'content': piece})], cid=cid, created=created, model=model))}\n\n"
 
                 if parsed_tools:
                     for i, tc in enumerate(parsed_tools):
@@ -1755,6 +1806,8 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     yield start_evt
 
     parser = StreamToolParser()
+    # [v81] 泄露闸门：解析器认不出的畸形工具标记不再以正文流出
+    gate = _LeakGate()
     full_text = ""
     text_block_started = False
     block_index = 0
@@ -1799,12 +1852,23 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 
             for r in parser.feed(chunk):
                 if "text" in r:
-                    if not text_block_started:
-                        start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                        yield start_block
-                        text_block_started = True
-                    delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
-                    yield delta_evt
+                    for piece in gate.feed(r["text"]):
+                        if not text_block_started:
+                            start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            yield start_block
+                            text_block_started = True
+                        delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': piece}})}\n\n"
+                        yield delta_evt
+        # [v81] 流结束裁决：暂扣区放行围栏内内容、丢弃围栏外标记残渣
+        for piece in gate.flush():
+            if piece:
+                if not text_block_started:
+                    start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    yield start_block
+                    text_block_started = True
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': piece}})}\n\n"
+        if gate.dropped:
+            logger.warning("[v81 leak-gate] chat %s (anthropic): dropped %d chars of unparsed tool markup from visible content", str(session_id)[:8], gate.dropped)
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
@@ -1880,6 +1944,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             for r in parser.flush():
                 if "text" in r:
                     flushed_text += r["text"]
+            # [v81] 暂扣区裁决：围栏内放行，围栏外标记残渣丢弃
+            for piece in gate.flush():
+                flushed_text += piece
 
         if not text_block_started and not parsed_tools and (clean_text or flushed_text):
             tail_events += _tb(clean_text or flushed_text)

@@ -2470,6 +2470,95 @@ class StreamToolParser:
         return out
 
 
+# ── [v81] 工具标记泄露闸门 ─────────────────────────────────────────────
+# 实锤 2026-10-31 20:38（chat 86983f4f，连续两轮）：模型吐出解析器认不出
+# 的畸形工具标记（<tool_call>{"arguments": ...}，无 invoke 结构），
+# StreamToolParser 只能当普通正文放行，用户在正文里直接看到标记生肉；
+# functions 层要到流结束（FINISHED）才发现"正文只剩未解析标记"并触发
+# 自动续写——为时已晚，标记已经实时流出去了。
+# 本闸门挂在 StreamToolParser 之后：正文文本凡出现工具标记家族成员
+# （含跨分片的"半个标记"）一律暂扣；flush() 统一裁决——代码围栏内的
+# 照常放行（教学样例豁免，与 parse_tools 的 hidden 规则一致），围栏外
+# 的标记残渣丢弃（修复/续写由既有 salvage + auto-continue 链路负责，
+# 其输入是上游原始分片，不经本闸门，行为不变）。正常正文零改动。
+_LEAK_MARKERS = (
+    "<tool_call>", "</tool_call>", "<tool_calls>", "</tool_calls>",
+    "<invoke>", "</invoke>", "<function_call>", "</function_call>",
+    "<tool_call/>", "<tool_calls/>", "<invoke/>", "<function_call/>",
+    "<｜｜DSML", "</｜｜DSML", "<||DSML", "</||DSML",
+)
+
+
+class _LeakGate:
+    """正文流出前的最后一道闸：工具标记家族成员只许走 tool_calls 通道，
+    不许以 content 形式漏到用户眼前。"""
+
+    def __init__(self):
+        self._seen = ""    # 闸门见过的全部正文（算代码围栏区间用）
+        self._hold = ""    # 暂扣区（从第一个疑似标记起）
+        self.dropped = 0   # 丢弃的字符数（供调用方记日志）
+
+    def feed(self, text):
+        self._seen += text
+        self._hold += text
+        return self._drain()
+
+    def _drain(self):
+        out = []
+        pos = -1
+        for m in _LEAK_MARKERS:
+            p = self._hold.find(m)
+            if p != -1 and (pos == -1 or p < pos):
+                pos = p
+        if pos != -1:
+            if pos:
+                out.append(self._hold[:pos])
+            self._hold = self._hold[pos:]  # 从标记起整段隔离到 flush
+            return out
+        # 没有完整标记：扣住可能是"半个标记"的尾巴（跨分片拼接）
+        keep = 0
+        for m in _LEAK_MARKERS:
+            for k in range(min(len(m) - 1, len(self._hold)), keep, -1):
+                if self._hold.endswith(m[:k]):
+                    keep = k
+                    break
+        cut = len(self._hold) - keep
+        if cut > 0:
+            out.append(self._hold[:cut])
+            self._hold = self._hold[cut:]
+        return out
+
+    def flush(self):
+        """流结束裁决：围栏内放行，围栏外丢弃。"""
+        if not self._hold:
+            return []
+        hold, self._hold = self._hold, ""
+        start = len(self._seen) - len(hold)
+        spans = _code_fence_spans(self._seen)
+        # 按围栏内外切段
+        segs = []
+        seg, seg_f = "", None
+        for i, ch in enumerate(hold):
+            f = any(s <= start + i < e for s, e in spans)
+            if seg_f is None or f == seg_f:
+                seg += ch
+            else:
+                segs.append((seg, seg_f))
+                seg = ch
+            seg_f = f
+        if seg:
+            segs.append((seg, seg_f))
+        emit = []
+        for text, fenced in segs:
+            if fenced or not any(m in text for m in _LEAK_MARKERS):
+                # 围栏内教学样例照常放行；围栏外不含标记的残余正文也放行
+                emit.append(text)
+            else:
+                # 围栏外的工具标记残渣：丢弃（修复走 salvage，重试走续写）
+                self.dropped += len(text)
+        return ["".join(emit)] if emit else []
+
+
 def summarize_messages(messages, max_tokens=500):
     recent = messages[-10:] if len(messages) > 10 else messages
     parts = []
@@ -2824,6 +2913,64 @@ _SALVAGE_PARAM_RE = re.compile(
 )
 _SALVAGE_INVOKE_SYNTH = '\n<｜｜DSML｜｜ invoke name="%s">'
 
+# [v80] 缺参数闭合补写三件套。线上实锤（2026-10-31 11:37 UTC，chat d13d3e76）：
+# 上游把参数开口写出来后闭合标签丢失（<...parameter name="command"...>cd /tmp ...
+# 后直接跟下一个参数开口），_SALVAGE_PARAM_RE 要求成对闭合 → 整个参数匹配
+# 失败 → 推断不出工具 → 抢救链整体失效，被迫走续写轮（用户看到同一动作
+# 重复执行）。v80 在主抢救前增加一遍确定性补写：真闭合在边界前存在 →
+# 逐字节不动；确实缺失 → 在下一个结构边界前插入规范闭合。
+_SALVAGE_PARAM_OPEN_RE = re.compile(
+    r"<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*parameter\s+name=[\x27\x22][^\x27\x22]+[\x27\x22][^>]*>",
+    re.IGNORECASE,
+)
+_SALVAGE_PARAM_CLOSER_ONLY_RE = re.compile(
+    r"</[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*parameter\s*>",
+    re.IGNORECASE,
+)
+# 闭合必须出现在下一个 DSML 结构边界之前：任何 invoke/calls/tool_call 标签
+# （开或闭）或下一个参数开口。注意参数闭合自身不构成边界——否则带闭合的
+# 健康参数会被误判缺失。
+_SALVAGE_BOUNDARY_RE = re.compile(
+    r"</?[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*(?:invoke|function_call|calls|tool_call)[\s>/]"
+    r"|<[｜\| \t]{0,8}(?:DSML[｜\| \t]{0,8}>?)?\s*parameter\s+name=",
+    re.IGNORECASE,
+)
+_SALVAGE_PARAM_CLOSER_SYNTH = "</｜｜DSML｜｜ parameter>"
+# [v80] "掉斜杠"的残缺参数闭合（主循环 _SALVAGE_CLOSER_FIX_RE 可修）。
+# 窗口内存在它时视为闭合已存在，不补写——否则会产生双重闭合。
+_SALVAGE_PARAM_CLOSER_BROKEN_RE = re.compile(
+    r"[｜|]{2}\s*DSML\s*[｜|]{2}\s*parameter\s*>"
+)
+
+
+def _insert_missing_param_closers(text, hidden_fn):
+    """[v80] 第一遍修复：参数开口缺闭合时在下一个结构边界前补写规范闭合。
+
+    只做确定性补写，绝不瞎猜：闭合在边界前存在 → 不动；围栏/行内码/思考
+    区内的开口 → 不碰。健康文本逐字节原样返回。返回 (new_text, 补写数)。"""
+    out_parts = []
+    last = 0
+    inserted = 0
+    for om in _SALVAGE_PARAM_OPEN_RE.finditer(text):
+        if hidden_fn(om.start()):
+            continue
+        bm = _SALVAGE_BOUNDARY_RE.search(text, om.end())
+        window_end = bm.start() if bm else len(text)
+        if _SALVAGE_PARAM_CLOSER_ONLY_RE.search(text, om.end(), window_end):
+            continue
+        # [v80] 窗口内存在掉斜杠的残缺闭合 → 闭合已存在（主循环会修），
+        # 不补写，避免双重闭合。
+        if _SALVAGE_PARAM_CLOSER_BROKEN_RE.search(text[om.end():window_end]):
+            continue
+        out_parts.append(text[last:window_end])
+        out_parts.append(_SALVAGE_PARAM_CLOSER_SYNTH)
+        inserted += 1
+        last = window_end
+    if not inserted:
+        return text, 0
+    out_parts.append(text[last:])
+    return "".join(out_parts), inserted
+
 
 def _salvage_tool_name_from_hint(args_keys, tools_hint):
     """required ⊆ 实参键集 的唯一工具名；唯一才认，多候选/零候选都不猜。"""
@@ -2846,11 +2993,28 @@ def _salvage_tool_name_from_hint(args_keys, tools_hint):
 def _salvage_tool_markup(text, tools_hint=None):
     """[v78] 修复模型写坏的 DSML 工具块（掉斜杠闭合 + 缺 invoke 开口）。
 
-    返回修复后的文本；无法修复的块原样保留（交由既有 malformed 判定）。
-    未发生任何修复时返回值与入参逐字节相同。tools_hint 为本轮 OpenAI
-    工具表（缺省读 request_tools ContextVar）。"""
+    [v80] 第一遍先补写缺失的参数闭合（线上 2026-10-31 实锤病灶：参数
+    闭包丢失导致 _SALVAGE_PARAM_RE 全体失配、抢救链整体失效）。无法
+    修复的块原样保留（交由既有 malformed 判定）。未发生任何修复时返回值
+    与入参逐字节相同。tools_hint 为本轮 OpenAI 工具表（缺省读
+    request_tools ContextVar）。"""
     if not text or "DSML" not in text:
         return text
+
+    def _hidden_in(f_spans, t_spans, pos):
+        return any(s <= pos < e for s, e in f_spans) or any(
+            s <= pos < e for s, e in t_spans
+        )
+
+    # [v80] 第一遍：缺参数闭合补写（用原文偏移量计算豁免区间）
+    _f0 = _code_fence_spans(text)
+    _f0 += [m.span() for m in re.finditer(r"`[^`\n]*`", text)]
+    _t0 = [m.span() for m in _THINK_SPAN_RE.finditer(text)]
+    text, closer_fixes = _insert_missing_param_closers(
+        text, lambda p: _hidden_in(_f0, _t0, p))
+    if not text:
+        return text
+
     fence_spans = _code_fence_spans(text)
     # [v78] 行内代码（单反引号）里的 DSML 是教学示例，不是坏块——
     # 与 _has_unswallowed_tool_markup 的行内豁免同一实证（edac56c5）。
@@ -2858,16 +3022,14 @@ def _salvage_tool_markup(text, tools_hint=None):
     think_spans = [m.span() for m in _THINK_SPAN_RE.finditer(text)]
 
     def hidden(pos):
-        return any(s <= pos < e for s, e in fence_spans) or any(
-            s <= pos < e for s, e in think_spans
-        )
+        return _hidden_in(fence_spans, think_spans, pos)
 
     if tools_hint is None:
         tools_hint = request_tools.get()
 
     out_parts = []
     last = 0
-    repaired = 0
+    repaired = closer_fixes  # [v80] 预检补写数计入总修复数
     for cm in _SALVAGE_CALLS_BLOCK_RE.finditer(text):
         if hidden(cm.start()):
             continue
@@ -2910,6 +3072,22 @@ def _salvage_tool_markup(text, tools_hint=None):
                                 cand = maybe_name.strip()
                 if not cand:
                     cand = _salvage_tool_name_from_hint(args.keys(), tools_hint)
+                # [v80] schema 闸门：名字能对上但必填参数不齐 → 修复结果
+                # 必然在派发层失败，与其产出注定失败的调用不如退回续写轮
+                # 让模型重写。仅收紧确定性：缺 required 或名字不在工具表
+                # 时不合成开口，行为下限=既有续写路径。
+                if cand and tools_hint:
+                    _fn = None
+                    for _t in tools_hint:
+                        if not isinstance(_t, dict):
+                            continue
+                        _f = _t.get("function") if isinstance(_t.get("function"), dict) else _t
+                        if _f.get("name") == cand:
+                            _fn = _f
+                            break
+                    _req = ((_fn.get("parameters") or {}).get("required")) or [] if _fn else []
+                    if _req and not set(_req) <= set(args):
+                        cand = None
                 if cand:
                     fixed_block = (_SALVAGE_INVOKE_SYNTH % cand) + fixed_block
                     repaired += 1
@@ -2920,7 +3098,10 @@ def _salvage_tool_markup(text, tools_hint=None):
             last = cm.end(1)
     if not repaired:
         return text
-    logger.warning("[v78 salvage] 修复 %d 处畸形工具标记（掉斜杠闭合/缺 invoke 开口）", repaired)
+    logger.warning(
+        "[v78 salvage] 修复 %d 处畸形工具标记（掉斜杠闭合/缺 invoke 开口/缺参数闭合）",
+        repaired,
+    )
     out_parts.append(text[last:])
     return "".join(out_parts)
 
@@ -3355,8 +3536,9 @@ _MALFORMED_TOOL_PROMPT = (
     "错误位置：你上一条消息里的那次工具调用，即紧挨本通知之前的最后一段输出。\n"
     "常见病因：工具调用块缺少 <invoke name=\"工具名\"> 开口行，或闭合标签"
     "丢了 </ 中的斜杠，或 name / arguments 字段缺失。\n"
-    "工具调用的正确格式为（name 与 arguments 两个字段都不可缺少）：\n"
-    "<tool_call>{\"name\": \"工具名\", \"arguments\": {...}}</tool_call>\n\n"
+    "工具调用的正确格式为（name 与 arguments 两个字段都不可缺少；"
+    "示例仅供参照格式，切勿照抄示例内容，工具名必须是真实存在的工具）：\n"
+    "```\n<tool_call>{\"name\": \"工具名\", \"arguments\": {...}}</tool_call>\n```\n\n"
     "请重新发出格式正确的工具调用；如果这个任务已不需要工具，"
     "直接给出最终答案，不要复述上文，不要解释这个错误。"
 )
@@ -3386,6 +3568,28 @@ def malformed_continue_count(chat_id):
 
 def reset_malformed_continue_count(chat_id):
     _MALFORMED_CONTINUE_COUNT.pop(chat_id, None)
+
+
+# [v79] 空流兜底计数器：上游流"正常结束但零可见输出"（悬空轮）时 +1；
+# 有可见输出的正常回合清零。悬空轮会在上游会话记忆里留下"用户消息发出
+# 后模型零回复"的断点，后续上下文断裂（生产实证 2026-10-30 会话 67010e7d
+# 失忆事件：22:26:54 轮零输出 → 客户端收到空回复 → 模型对"四件事"失忆）。
+# 与 _MALFORMED_CONTINUE_COUNT 同一套机制：app.handle_chat 在同会话计数
+# 达到阈值时强制换血（rollover 到全新上游会话），摘要重建，坏状态不回流。
+_EMPTY_STREAM_COUNT = {}
+
+
+def empty_stream_count(chat_id):
+    return _EMPTY_STREAM_COUNT.get(chat_id, 0)
+
+
+def bump_empty_stream_count(chat_id):
+    _EMPTY_STREAM_COUNT[chat_id] = _EMPTY_STREAM_COUNT.get(chat_id, 0) + 1
+    return _EMPTY_STREAM_COUNT[chat_id]
+
+
+def reset_empty_stream_count(chat_id):
+    _EMPTY_STREAM_COUNT.pop(chat_id, None)
 
 
 def _extract_malformed_call(text: str, limit: int = 400) -> str:
@@ -3619,6 +3823,24 @@ async def _send_message_locked(chat_id, auth_token, message, parent_message_id, 
             interrupt_reason = getattr(e, "reason", "interrupted")
             interrupt_detail = getattr(e, "detail", "")
             pass
+        except UpstreamError as e:
+            # [v81] 空流重试：上游偶发返回完全空的 SSE（零碎片）。实锤
+            # 2026-10-31 21:02（key:2 客户端）：工具结果回传轮上游空流，
+            # 502 直接穿透到客户端，用户看到"模型调用完工具就停了"。
+            # 空流 = 本轮什么都没产出，按"无可见正文的中断"处理走续写
+            # （visible.seen=False 自动命中 v64 的禁 END 提示词分流）。
+            # 上下文超限变体（prompt may exceed）不重试——继续问只会再
+            # 超限；其余错误码（401/403/429/400、上游报错事件）语义明确，
+            # 照旧上抛。
+            if getattr(e, "status", None) == 502 and "no assistant fragments" in str(e):
+                for out in flt.flush():
+                    emitted = (emitted + out)[-400:]
+                    visible.feed(out)
+                    yield out
+                interrupt_reason = "empty_stream"
+                logger.warning("[v81] 上游空流（502 零输出），按中断处理走自动续写")
+            else:
+                raise
         if clean_end:
             asyncio.create_task(_prefetch_pow(auth_token, "/api/v0/chat/completion"))
             if visible.seen:
