@@ -21,9 +21,11 @@ from dotenv import load_dotenv
 from uvicorn.logging import AccessFormatter
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+import i18n
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2589,7 +2591,7 @@ async def list_models(request: Request):
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    return templates.TemplateResponse(request, "login.html", {"error": None})
+    return i18n.page(request, "login.html", {"error": None})
 
 
 def _prune_admin_sessions():
@@ -2608,7 +2610,7 @@ async def login_submit(request: Request):
     password = form.get("password", "")
     _prune_admin_sessions()
     if time.time() < _login_fails["locked_until"]:
-        return templates.TemplateResponse(request, "login.html", {"error": "Too many attempts. Try again later."})
+        return i18n.page(request, "login.html", {"error": i18n.msg("too_many_attempts")})
     if secrets.compare_digest(username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and secrets.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
         _login_fails["count"] = 0
         sid = str(uuid.uuid4())
@@ -2620,8 +2622,24 @@ async def login_submit(request: Request):
     if _login_fails["count"] >= 5:
         _login_fails["locked_until"] = time.time() + 300
         _login_fails["count"] = 0
-    return templates.TemplateResponse(request, "login.html", {"error": "Invalid username or password"})
+    return i18n.page(request, "login.html", {"error": i18n.msg("invalid_credentials")})
 
+
+
+@app.get("/set-lang/{lang}")
+async def set_lang(lang: str, request: Request):
+    """Pre-login language switcher: remember the choice in a cookie and return."""
+    # Scheme-relative and cross-origin targets are refused (open-redirect guard).
+    nxt = request.query_params.get("back") or request.headers.get("referer") or "/"
+    if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
+        nxt = "/"
+    if lang in i18n.SUPPORTED_LANGS:
+        resp = RedirectResponse(nxt, status_code=303)
+        resp.set_cookie(i18n.COOKIE_NAME, lang, httponly=True, samesite="lax",
+                        max_age=365 * 24 * 3600)
+        return resp
+    resp = RedirectResponse(nxt, status_code=303)
+    return resp
 
 @app.get("/logout")
 async def logout(request: Request):
@@ -2639,7 +2657,7 @@ async def dashboard(request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     tokens = await _db(get_tokens)
-    return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
+    return i18n.page(request, "dashboard.html", {"tokens": tokens})
 
 
 @app.post("/v1/pool/restore")

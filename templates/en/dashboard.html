@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - DeeperSeeker{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<section>
+    <h2>Add Auth Token</h2>
+    <div class="steps">
+        <p><strong>Steps:</strong></p>
+        <ol>
+            <li>Open an <strong>incognito/private</strong> browser window</li>
+            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and log in</li>
+            <li>Extract the token — <strong>pick the method matching your device</strong> (both are kept, either works):</li>
+        </ol>
+
+        <p><strong>Method A · Desktop / Android (has DevTools)</strong></p>
+        <p>Open DevTools (F12) → Console → paste:</p>
+        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
+
+        <p><strong>Method B · iPhone / iPad (Shortcuts) — recommended, verified to work</strong></p>
+        <p>Use the "Run JavaScript on Web Page" action in the Shortcuts app. It has full page access and, unlike a bookmark, <strong>does not</strong> trigger the iOS "The operation is insecure" error:</p>
+        <ol>
+            <li>Shortcuts app → <strong>+</strong> in the top-right corner, create new → add the action "<strong>Run JavaScript on Web Page</strong>" → paste into the script box:</li>
+        </ol>
+        <pre style="white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:10px;border-radius:6px;font-size:12px"><code>var out = '';
+try {
+  var r = localStorage.getItem('userToken');
+  if (r) { try { out = JSON.parse(r).value || r; } catch(e) { out = r; } }
+} catch(e) { out = ''; }
+if (out) { completion(out); } else { completion('No token: make sure you are logged in to chat.deepseek.com in Safari'); }</code></pre>
+        <ol start="2">
+            <li>Then add the action "<strong>Copy to Clipboard</strong>"</li>
+            <li><strong>Key step (without it "the shortcut runs but returns nothing")</strong>: at the bottom of the shortcut, edit the receiving input → type "<strong>Safari Web Page</strong>", and confirm the JS action's "Page" input is connected to the previous step</li>
+            <li>Usage: open the logged-in <strong>chat.deepseek.com</strong> in Safari (after the page fully loads) → tap <strong>Share</strong> → <strong>Run Shortcut</strong> → the token lands on the clipboard and shows in a popup</li>
+        </ol>
+
+        <details style="margin-top:10px">
+            <summary style="cursor:pointer">Method C · Safari bookmarklet (fallback: some iOS builds report The operation is insecure — if so, use Method B)</summary>
+            <div style="padding:8px 12px">
+                <p>iOS does not allow running <code>javascript:</code> directly in the address bar — a bookmark is the only entry point. But some iOS builds block localStorage reads from bookmarklet scripts (SecurityError, unrelated to the "Block All Cookies" setting) — if you hit an error, switch to Method B.</p>
+                <ol>
+                    <li>Open any ordinary page in Safari → <strong>Share</strong> → <strong>Add to Bookmarks</strong> → Save</li>
+                    <li>Bookmarks list → <strong>Edit</strong> that entry → replace the entire "Address" with the code below → Save</li>
+                    <li>On the logged-in chat.deepseek.com page tap the bookmark → auto-copies</li>
+                </ol>
+                <pre style="white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:10px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto"><code>javascript:(function(){var t='';try{var r=localStorage.getItem('userToken');if(r){try{t=JSON.parse(r).value||r;}catch(e){t=r;}}}catch(e){alert('Read failed: '+e.message+' (use Method B — Shortcuts)');return;}if(!t||t.length&lt;20){alert('No userToken found. Make sure you are logged in and the page finished loading.');return;}var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();a.setSelectionRange(0,999999);var ok=document.execCommand('copy');a.remove();alert((ok?'Copied to clipboard ✓\n\n':'Copy failed — long-press to copy manually\n\n')+'length '+t.length+'\n'+t.substring(0,12)+'...');})();</code></pre>
+            </div>
+        </details>
+        <p class="hint">Android can also use the Method C bookmark (recent Chrome versions also block <code>javascript:</code> in the address bar), or keep using the F12 console.</p>
+    </div>
+    <div class="warning">
+        Note: if you log out of DeepSeek in the browser, this token stops working.
+    </div>
+    <form method="post" action="/tokens/add">
+        <input type="text" name="alias" placeholder="Alias (optional, e.g. main account, spare1)" style="width:220px">
+        <input type="text" name="auth_token" placeholder="Paste the token here (no quotes)" style="width:400px">
+        <button type="submit">Add Token</button>
+    </form>
+</section>
+
+<section>
+    <h2>Token Pool ({{ tokens|length }})</h2>
+    {% if tokens %}
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Alias</th>
+                <th>Token</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for tok in tokens %}
+            <tr>
+                <td>{{ tok['id'] }}</td>
+                <td>{{ tok['alias'] or '—' }}</td>
+                <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
+                <td>
+                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
+                        {{ {'ACTIVE':'Active','RATE_LIMITED':'Cooling down (rate limit)'}.get(tok['status'], tok['status']) }}
+                    </span>
+                </td>
+                <td>
+                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
+                          onsubmit="return confirm('Delete this token?')">
+                        <button type="submit" class="btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No tokens yet — add one above.</p>
+    {% endif %}
+</section>
+
+<section>
+    <h2>API Info</h2>
+    <p>OpenAI-compatible: <code>http://free-bots.heavencloud.in:3383/v1</code></p>
+    <p>Anthropic-compatible: <code>http://free-bots.heavencloud.in:3383</code></p>
+    <p>Model: <code>v4.1flash</code> (DeepSeek default model)</p>
+</section>
+{% endblock %}
